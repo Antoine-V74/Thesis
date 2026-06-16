@@ -1,4 +1,4 @@
-# ECG Processing
+# Master Thesis — ECG Processing
 
 This project is organized by safety layer.
 
