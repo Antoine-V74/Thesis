@@ -1,0 +1,17 @@
+# Layer 1 + Layer 2 runtime (Pynapse-compatible path)
+numpy
+scipy
+pandas
+PyWavelets
+wfdb
+py-ecg-detectors  # RPeakDetection algorithm comparison
+
+# Layer 1 visualization / offline tools
+matplotlib
+
+# Layer 3 research (optional for Layers 1-2 smoke tests)
+# CPU-only PyTorch is enough for validation smoke tests. For NVIDIA GPU
+# pretraining, install the CUDA wheel separately, for example:
+#   .\.venv\Scripts\python.exe -m pip install --force-reinstall --no-cache-dir torch==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+torch
+scikit-learn
