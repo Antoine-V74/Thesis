@@ -123,8 +123,7 @@ Useful options:
 
 ## Result Files
 
-Results are written locally under `Results/rpeak_comparison/...` and are ignored
-by Git.
+Results will be written locally under `Results/rpeak_comparison/...`.
 
 | File | Purpose |
 |---|---|
@@ -137,9 +136,6 @@ by Git.
 | `run_config.json` | Exact run configuration and skipped datasets. |
 | `comparison.log` | Runtime log. |
 
-For GitHub, keep only small curated summaries/figures in a tracked `reports/`
-folder. Keep full generated outputs outside Git or archive them in Zenodo, OSF,
-institutional storage, or GitHub Releases.
 
 ## References
 
