@@ -65,7 +65,7 @@ class AcquisitionFunction(ABC):
         ----------
         X      : (n, d) candidate parameter vectors (original / un-normalised space)
         gp     : fitted GPSurrogate
-        best_y : current best observed objective value (we are maximising)
+        best_y : current best observed score value (we are maximizing)
 
         Returns
         -------

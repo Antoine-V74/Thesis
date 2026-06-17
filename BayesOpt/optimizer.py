@@ -1,69 +1,40 @@
-"""
-BayesianOptimizer: main optimisation loop.
-
-Typical usage (5 lines of integration code)
---------------------------------------------
-    from optimizer import BayesianOptimizer
-    from kernels import get_kernel
-    from acquisition import CoolingUCB
-    from objective import BaselineProfile, LiteratureObjective
-    from api import FunctionAdapter
-
-    baseline = BaselineProfile.from_outputs(my_lv_sim(contraction=0.0, contraction_velocity=0.0))
-    bridge = FunctionAdapter(my_lv_sim, param_names=["contraction", "contraction_velocity"])
-    opt = BayesianOptimizer(
-        bridge=bridge,
-        objective=LiteratureObjective(baseline=baseline),
-        param_bounds={"contraction": (0.1, 1.0), "contraction_velocity": (0.05, 2.0)},
-        kernel="matern52",
-        acquisition=CoolingUCB(budget=30),
-    )
-    opt.run(n_init=5, n_iter=25)
-    print(opt.best_params)   # {'contraction': ..., 'contraction_velocity': ...}
-    print(opt.best_outputs)  # {'LVEDP': ..., 'aortic_flow': ..., ...}
-
-Manual / asynchronous loop
-----------------------------
-    params = opt.suggest()                          # ask for next params
-    outputs = my_lv_sim(**params)                   # run simulation externally
-    opt.observe(params, outputs)                    # record result
-    # repeat...
-
-Warm-starting from a previous run
------------------------------------
-    opt.load_history("results/run1.json")
-    opt.run(n_init=0, n_iter=15)   # skip random init, continue BO
-"""
+"""Bayesian optimization loop used by the public API."""
 from __future__ import annotations
 
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 import numpy as np
 
 from acquisition import AcquisitionFunction, CoolingUCB
 from gp_surrogate import GPSurrogate
 from kernels import get_kernel
-from objective import Objective
-from api import SimulatorAdapter as SimulatorBridge
+from score_function import ScoreFunction
 
 
 ParamBounds = Dict[str, Tuple[float, float]]
 
 
+class SimulatorBridge(Protocol):
+    """Minimal simulation interface expected by the optimizer."""
+
+    def run_timed(self, params: Dict[str, float]) -> tuple[Optional[Dict[str, float]], float]:
+        """Run one simulation and return outputs plus elapsed seconds."""
+
+
 class BayesianOptimizer:
-    """Bayesian optimisation over MNA / cardiac simulation parameters.
+    """Bayesian optimization over MNA / cardiac simulation parameters.
 
     Parameters
     ----------
-    bridge        : SimulatorBridge — connection to the simulation
-    objective     : Objective       — maps sim outputs to a scalar to maximise
+    bridge        : SimulatorBridge - connection to the simulation
+    score_function: ScoreFunction   - maps sim outputs to a scalar score
     param_bounds  : {name: (lo, hi)} for each parameter
     kernel        : sklearn Kernel or name string (required; e.g. "matern52")
     acquisition   : AcquisitionFunction (default CoolingUCB)
-    n_restarts_gp : GP hyperparameter optimisation restarts per fit (default 5)
+    n_restarts_gp : GP hyperparameter optimization restarts per fit (default 5)
     seed          : global random seed for reproducibility
     verbose       : print iteration logs by default
     """
@@ -71,16 +42,21 @@ class BayesianOptimizer:
     def __init__(
         self,
         bridge: SimulatorBridge,
-        objective: Objective,
-        param_bounds: ParamBounds,
-        kernel,
+        score_function: Optional[ScoreFunction] = None,
+        param_bounds: Optional[ParamBounds] = None,
+        kernel=None,
+        *,
         acquisition: Optional[AcquisitionFunction] = None,
         n_restarts_gp: int = 5,
         seed: int = 42,
         verbose: bool = True,
     ) -> None:
         self.bridge = bridge
-        self.objective = objective
+        if score_function is None:
+            raise ValueError("BayesianOptimizer requires a score_function.")
+        if param_bounds is None:
+            raise ValueError("BayesianOptimizer requires param_bounds.")
+        self.score_function = score_function
         self.param_names: List[str] = list(param_bounds.keys())
         self.param_bounds: ParamBounds = param_bounds
         self.bounds_array: np.ndarray = np.array(
@@ -126,7 +102,7 @@ class BayesianOptimizer:
         n_iter: int = 20,
         verbose: Optional[bool] = None,
     ) -> "BayesianOptimizer":
-        """Execute the full optimisation loop.
+        """Execute the full optimization loop.
 
         Parameters
         ----------
@@ -162,19 +138,23 @@ class BayesianOptimizer:
         # --- BO phase ---
         for i in range(n_iter):
             self._fit_gp()
-            x_next = self.acquisition.maximize(
-                self.gp,
-                bounds=self.bounds_array,
-                best_y=self.best_value,
-                rng=self.rng,
-            )
-            label = f"BO   {i + 1:2d}/{n_iter}"
+            if self.gp._fitted:
+                x_next = self.acquisition.maximize(
+                    self.gp,
+                    bounds=self.bounds_array,
+                    best_y=self.best_value,
+                    rng=self.rng,
+                )
+                label = f"BO   {i + 1:2d}/{n_iter}"
+            else:
+                x_next = self._latin_hypercube(1)[0]
+                label = f"explore {i + 1:2d}/{n_iter}"
             self._evaluate(x_next, label=label, loud=loud)
             self.acquisition.step()
 
         if loud:
             print("-" * 60)
-            print(f"  Best value : {self.best_value:.4f}")
+            print(f"  Best score : {self.best_value:.4f}")
             print(f"  Best params: {self.best_params}")
             print("=" * 60)
 
@@ -189,16 +169,19 @@ class BayesianOptimizer:
         -------
         params dict ready to pass to your simulation.
         """
-        if len(self._y) < 2:
+        if self._finite_count < 2:
             x = self._latin_hypercube(1)[0]
         else:
             self._fit_gp()
-            x = self.acquisition.maximize(
-                self.gp,
-                bounds=self.bounds_array,
-                best_y=self.best_value,
-                rng=self.rng,
-            )
+            if self.gp._fitted:
+                x = self.acquisition.maximize(
+                    self.gp,
+                    bounds=self.bounds_array,
+                    best_y=self.best_value,
+                    rng=self.rng,
+                )
+            else:
+                x = self._latin_hypercube(1)[0]
         return self._vec_to_dict(x)
 
     def observe(
@@ -211,7 +194,7 @@ class BayesianOptimizer:
         Call this after `suggest()` when you run the simulation yourself.
         """
         x = np.array([params[k] for k in self.param_names], dtype=float)
-        y = self.objective(outputs)
+        y = self.score_function(outputs)
         self._X.append(x)
         self._y.append(y)
         self._raw_outputs.append(outputs)
@@ -225,7 +208,7 @@ class BayesianOptimizer:
 
     @property
     def best_value(self) -> float:
-        """Best objective value observed so far."""
+        """Best score observed so far."""
         if not self._y:
             return float("-inf")
         finite = [v for v in self._y if np.isfinite(v)]
@@ -233,18 +216,18 @@ class BayesianOptimizer:
 
     @property
     def best_params(self) -> Dict[str, float]:
-        """Parameter dict that achieved the best objective value."""
-        if not self._y:
+        """Parameter dict that achieved the best score."""
+        idx = self._best_index()
+        if idx is None:
             return {}
-        idx = int(np.argmax(self._y))
         return self._vec_to_dict(self._X[idx])
 
     @property
     def best_outputs(self) -> Dict[str, float]:
         """Full simulation output dict at the best observed point."""
-        if not self._y:
+        idx = self._best_index()
+        if idx is None:
             return {}
-        idx = int(np.argmax(self._y))
         return dict(self._raw_outputs[idx])
 
     @property
@@ -252,21 +235,37 @@ class BayesianOptimizer:
         return len(self._y)
 
     @property
+    def _finite_count(self) -> int:
+        return int(np.isfinite(np.asarray(self._y, dtype=float)).sum())
+
+    @property
     def history(self) -> List[Dict[str, Any]]:
         """Full evaluation history as a list of dicts (for analysis / plotting)."""
-        return [
-            {
-                "iteration": i,
-                "label": self._labels[i] if i < len(self._labels) else "",
-                "params": self._vec_to_dict(x),
-                "objective": float(y),
-                "best_so_far": float(max(self._y[: i + 1])),
-                "outputs": dict(out),
-                "timestamp": ts,
-            }
-            for i, (x, y, out, ts) in enumerate(
-                zip(self._X, self._y, self._raw_outputs, self._timestamps)
+        best = float("-inf")
+        rows: List[Dict[str, Any]] = []
+        for i, (x, y, out, ts) in enumerate(
+            zip(self._X, self._y, self._raw_outputs, self._timestamps)
+        ):
+            if np.isfinite(y):
+                best = max(best, float(y))
+            rows.append(
+                {
+                    "iteration": i,
+                    "label": self._labels[i] if i < len(self._labels) else "",
+                    "params": self._vec_to_dict(x),
+                    "score": float(y),
+                    "best_so_far": best,
+                    "outputs": dict(out),
+                    "timestamp": ts,
+                }
             )
+        return rows
+
+    @property
+    def valid_history(self) -> List[Dict[str, Any]]:
+        """Evaluation history restricted to finite scores."""
+        return [
+            entry for entry in self.history if np.isfinite(entry["score"])
         ]
 
     # ------------------------------------------------------------------
@@ -274,7 +273,7 @@ class BayesianOptimizer:
     # ------------------------------------------------------------------
 
     def save(self, path: str | Path) -> None:
-        """Serialise optimisation history to JSON."""
+        """Serialize optimization history to JSON."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -304,7 +303,7 @@ class BayesianOptimizer:
         for entry in data.get("history", []):
             x = np.array([entry["params"][k] for k in self.param_names], dtype=float)
             self._X.append(x)
-            self._y.append(float(entry["objective"]))
+            self._y.append(float(entry["score"]))
             self._raw_outputs.append(entry.get("outputs", {}))
             self._timestamps.append(entry.get("timestamp", 0.0))
             self._labels.append(entry.get("label", "loaded"))
@@ -334,8 +333,8 @@ class BayesianOptimizer:
             y = float("-inf")
             msg = "FAILED"
         else:
-            y = self.objective(outputs)
-            msg = f"y={y:+.4f}"
+            y = self.score_function(outputs)
+            msg = f"score={y:+.4f}"
 
         self._X.append(x)
         self._y.append(y)
@@ -357,6 +356,16 @@ class BayesianOptimizer:
         if valid.sum() < 2:
             return
         self.gp.fit(X[valid], y[valid], bounds=self.bounds_array)
+
+    def _best_index(self) -> Optional[int]:
+        if not self._y:
+            return None
+        y = np.asarray(self._y, dtype=float)
+        valid = np.isfinite(y)
+        if not valid.any():
+            return None
+        valid_indices = np.flatnonzero(valid)
+        return int(valid_indices[np.argmax(y[valid])])
 
     def _latin_hypercube(self, n: int) -> np.ndarray:
         """Latin Hypercube Sampling over the parameter bounds."""

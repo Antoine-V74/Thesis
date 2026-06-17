@@ -1,21 +1,14 @@
 """
-BayesOpt public API — connect a simulation and run MNA parameter optimisation.
+Small public API for Bayesian optimization of MNA/stimulation parameters.
 
-Most users only need:
+Most users provide one function:
 
-    from api import run_mna_bayesopt
+    def simulate_episode(n_beats, **params):
+        return {"LVEDP": ..., "LVEDV": ..., "LVESV": ..., ...}
 
-    def simulate_episode(contraction, contraction_velocity, n_beats):
-        # run one full LV + MNA simulation episode
-        return {"LVEDP": ..., "aortic_flow": ..., ...}
+and then call:
 
-    results = run_mna_bayesopt(
-        simulate_episode=simulate_episode,
-        n_beats=10000,
-        kernel_name="matern52",
-    )
-
-If the model is launched as a Python script, use ``make_script_episode_function``.
+    results = run_bayesopt(simulate_episode, param_bounds={...}, n_beats=10000)
 """
 from __future__ import annotations
 
@@ -28,25 +21,21 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from acquisition import CoolingUCB
-from kernels import get_kernel
-from objective import BaselineProfile, LiteratureObjective, Objective
+from score_function import Baseline, HemodynamicScore, SafetyLimits, ScoreFunction
 
 
 SimParams = Dict[str, float]
 SimOutputs = Dict[str, float]
 EpisodeFunction = Callable[[float, float, int], SimOutputs]
+GenericEpisodeFunction = Callable[..., SimOutputs]
 
-
-# ---------------------------------------------------------------------------
-# Simulation adapters (used internally by the optimiser)
-# ---------------------------------------------------------------------------
 
 class SimulatorAdapter(ABC):
-    """Interface between BayesianOptimizer and a simulation."""
+    """Small interface between the optimizer and a simulation."""
 
     @abstractmethod
     def run(self, params: SimParams) -> SimOutputs:
-        """Run the simulation and return haemodynamic outputs."""
+        """Run the simulation and return output variables."""
 
     def run_safe(self, params: SimParams) -> Optional[SimOutputs]:
         try:
@@ -62,7 +51,7 @@ class SimulatorAdapter(ABC):
 
 
 class FunctionAdapter(SimulatorAdapter):
-    """Wrap a plain Python callable as a simulation adapter."""
+    """Wrap a normal Python function as a simulation."""
 
     def __init__(
         self,
@@ -80,8 +69,7 @@ class FunctionAdapter(SimulatorAdapter):
         if self.accept_dict:
             result = self.fn(params)
         else:
-            kwargs = {k: params[k] for k in self.param_names if k in params}
-            result = self.fn(**kwargs)
+            result = self.fn(**{k: params[k] for k in self.param_names})
 
         if not isinstance(result, dict):
             raise TypeError(
@@ -91,11 +79,11 @@ class FunctionAdapter(SimulatorAdapter):
         if self.output_map:
             result = {self.output_map.get(k, k): v for k, v in result.items()}
 
-        return result
+        return {k: float(v) for k, v in result.items()}
 
 
 class MockSimulation(SimulatorAdapter):
-    """Synthetic cardiac response for algorithm testing (no real model required)."""
+    """Small synthetic LV + MNA response used for smoke tests and demos."""
 
     def __init__(
         self,
@@ -103,103 +91,98 @@ class MockSimulation(SimulatorAdapter):
         noise_std: float = 0.02,
         seed: Optional[int] = 42,
     ) -> None:
+        import numpy as np
+
         self.param_names = param_names or ["contraction", "contraction_velocity"]
         self.noise_std = noise_std
-        import numpy as np
         self._rng = np.random.default_rng(seed)
 
     def run(self, params: SimParams) -> SimOutputs:
         import numpy as np
 
         c = float(params.get(self.param_names[0], 0.5))
-        cv = float(params.get(self.param_names[1], 0.5)) if len(self.param_names) > 1 else 0.5
-        r = float(np.exp(-((c - 0.65) ** 2 / 0.05 + (cv - 0.55) ** 2 / 0.03)))
+        cv = float(params.get(self.param_names[1], 0.5))
+        response = float(np.exp(-((c - 0.65) ** 2 / 0.05 + (cv - 0.55) ** 2 / 0.03)))
 
-        def n() -> float:
+        def noise() -> float:
             return float(self._rng.normal(0.0, self.noise_std))
 
-        lvedv = 110.0 + 30.0 * (1.0 - c) + n()
-        lvesv = 40.0 - 20.0 * r + n()
-        lvesp = 80.0 + 40.0 * r + n()
-        lvedp = 6.0 + 8.0 * (1.0 - r) + n()
-        rvedv = 95.0 + 20.0 * (1.0 - c) + n()
-        rvesv = 35.0 - 15.0 * r + n()
-        rvesp = 20.0 + 8.0 * r + n()
-        rvedp = 4.0 + 5.0 * (1.0 - r) + n()
-
         return {
-            "LVEDV": lvedv,
-            "LVESV": lvesv,
-            "LVESP": lvesp,
-            "LVEDP": lvedp,
-            "RVEDV": rvedv,
-            "RVESV": rvesv,
-            "RVESP": rvesp,
-            "RVEDP": rvedp,
-            "aortic_flow": 4.0 + 2.5 * r + n(),
-            "pulmonary_flow": 4.0 + 2.3 * r + n(),
+            "LVEDV": 110.0 + 30.0 * (1.0 - c) + noise(),
+            "LVESV": 40.0 - 20.0 * response + noise(),
+            "LVESP": 80.0 + 40.0 * response + noise(),
+            "LVEDP": 6.0 + 8.0 * (1.0 - response) + noise(),
+            "RVEDP": 4.0 + 5.0 * (1.0 - response) + noise(),
+            "aortic_flow": 4.0 + 2.5 * response + noise(),
+            "aortic_pressure": 80.0 + 35.0 * response + noise(),
+            "pulmonary_flow": 4.0 + 2.3 * response + noise(),
         }
 
 
-# Backward-compatible aliases used by run_demo / advanced scripts
-SimulatorBridge = SimulatorAdapter
-FunctionBridge = FunctionAdapter
-MockBridge = MockSimulation
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def run_mna_bayesopt(
-    simulate_episode: EpisodeFunction,
+def run_bayesopt(
+    simulate_episode: GenericEpisodeFunction,
     *,
+    param_bounds: Dict[str, Tuple[float, float]],
     n_beats: int = 1000,
-    contraction_bounds: Tuple[float, float] = (0.1, 1.0),
-    contraction_velocity_bounds: Tuple[float, float] = (0.05, 2.0),
-    baseline_params: Tuple[float, float] = (0.0, 0.0),
+    baseline_params: Optional[SimParams] = None,
     baseline_outputs: Optional[SimOutputs] = None,
-    objective: Optional[Objective] = None,
+    score_function: Optional[ScoreFunction] = None,
+    limits: Optional[SafetyLimits] = None,
+    weights: Optional[Dict[str, float]] = None,
+    accepts_dict: bool = False,
     n_init: int = 5,
     n_iter: int = 25,
-    kernel_name: str,
+    kernel_name: str = "matern52",
     seed: int = 42,
     save_path: str | Path | None = None,
     verbose: bool = True,
 ) -> Dict[str, object]:
-    """Run episode-level BO for MNA contraction parameters.
-
-    Each BO trial runs one full simulation episode at fixed
-    ``(contraction, contraction_velocity)`` for ``n_beats`` beats.
-
-    ``kernel_name`` is required on purpose so the GP kernel choice is explicit
-    in every optimisation run. Common choices are "matern52", "matern32",
-    "rbf", "rq", and "periodic".
-    """
+    """Run BO on any number of named parameters."""
     from optimizer import BayesianOptimizer
 
-    def wrapped_episode(contraction: float, contraction_velocity: float) -> SimOutputs:
-        return simulate_episode(contraction, contraction_velocity, n_beats)
+    if not param_bounds:
+        raise ValueError("param_bounds must contain at least one parameter.")
 
-    if baseline_outputs is None:
-        baseline_outputs = wrapped_episode(*baseline_params)
+    param_names = list(param_bounds)
+    _validate_param_bounds(param_bounds)
+    if baseline_params is not None:
+        _validate_param_values(baseline_params, param_names, label="baseline_params")
 
-    if objective is None:
-        baseline = BaselineProfile.from_outputs(baseline_outputs)
-        objective = LiteratureObjective(baseline=baseline)
+    def wrapped_episode(**params: float) -> SimOutputs:
+        if accepts_dict:
+            return simulate_episode(params, n_beats)
+        return simulate_episode(n_beats=n_beats, **params)
+
+    if baseline_outputs is None and score_function is None:
+        if baseline_params is None:
+            raise ValueError(
+                "baseline_params is required when BayesOpt builds the default "
+                "HemodynamicScore. Pass the unassisted/nominal parameter "
+                "values explicitly."
+            )
+        baseline_outputs = wrapped_episode(**baseline_params)
+
+    if score_function is None:
+        if baseline_outputs is None:
+            raise ValueError(
+                "baseline_outputs is required when score_function is not provided."
+            )
+        baseline = Baseline.from_outputs(baseline_outputs)
+        score_function = HemodynamicScore(
+            baseline=baseline,
+            limits=limits,
+            **(weights or {}),
+        )
 
     adapter = FunctionAdapter(
         wrapped_episode,
-        param_names=["contraction", "contraction_velocity"],
+        param_names=param_names,
     )
 
     opt = BayesianOptimizer(
         bridge=adapter,
-        objective=objective,
-        param_bounds={
-            "contraction": contraction_bounds,
-            "contraction_velocity": contraction_velocity_bounds,
-        },
+        score_function=score_function,
+        param_bounds=param_bounds,
         kernel=kernel_name,
         acquisition=CoolingUCB(budget=n_iter),
         seed=seed,
@@ -221,49 +204,120 @@ def run_mna_bayesopt(
     }
 
 
-def make_script_episode_function(
-    script_path: str | Path,
+def _validate_param_bounds(param_bounds: Dict[str, Tuple[float, float]]) -> None:
+    for name, bounds in param_bounds.items():
+        if len(bounds) != 2:
+            raise ValueError(f"Bounds for {name!r} must be a (low, high) pair.")
+        low, high = float(bounds[0]), float(bounds[1])
+        if low >= high:
+            raise ValueError(f"Bounds for {name!r} must satisfy low < high.")
+
+
+def _validate_param_values(
+    values: SimParams,
+    param_names: List[str],
     *,
-    python_executable: str | Path | None = None,
-    extra_args: Optional[list[str]] = None,
-    output_map: Optional[Dict[str, str]] = None,
-) -> EpisodeFunction:
-    """Build an episode function from a Python script.
+    label: str,
+) -> None:
+    missing = [name for name in param_names if name not in values]
+    if missing:
+        raise ValueError(f"{label} is missing values for: {missing}")
 
-    The script is called as:
 
-        python script.py --contraction C --contraction-velocity CV --n-beats N
+def run_mna_bayesopt(
+    simulate_episode: EpisodeFunction,
+    *,
+    n_beats: int = 1000,
+    contraction_bounds: Tuple[float, float] = (0.1, 1.0),
+    contraction_velocity_bounds: Tuple[float, float] = (0.05, 2.0),
+    baseline_params: Tuple[float, float] = (0.0, 0.0),
+    baseline_outputs: Optional[SimOutputs] = None,
+    score_function: Optional[ScoreFunction] = None,
+    limits: Optional[SafetyLimits] = None,
+    weights: Optional[Dict[str, float]] = None,
+    n_init: int = 5,
+    n_iter: int = 25,
+    kernel_name: str = "matern52",
+    seed: int = 42,
+    save_path: str | Path | None = None,
+    verbose: bool = True,
+) -> Dict[str, object]:
+    """Backward-compatible wrapper for contraction and contraction_velocity."""
 
-    It must print one JSON object to stdout with the haemodynamic outputs.
-    """
-    script_path = Path(script_path)
-    executable = str(python_executable or sys.executable)
-    extra_args = extra_args or []
-    output_map = output_map or {}
-
-    def run_script_episode(
+    def wrapped_mna_episode(
+        *,
         contraction: float,
         contraction_velocity: float,
         n_beats: int,
     ) -> SimOutputs:
+        return simulate_episode(contraction, contraction_velocity, n_beats)
+
+    return run_bayesopt(
+        wrapped_mna_episode,
+        param_bounds={
+            "contraction": contraction_bounds,
+            "contraction_velocity": contraction_velocity_bounds,
+        },
+        n_beats=n_beats,
+        baseline_params={
+            "contraction": baseline_params[0],
+            "contraction_velocity": baseline_params[1],
+        },
+        baseline_outputs=baseline_outputs,
+        score_function=score_function,
+        limits=limits,
+        weights=weights,
+        n_init=n_init,
+        n_iter=n_iter,
+        kernel_name=kernel_name,
+        seed=seed,
+        save_path=save_path,
+        verbose=verbose,
+    )
+
+
+def make_script_episode_function(
+    script_path: str | Path,
+    *,
+    param_names: Optional[List[str]] = None,
+    python_executable: str | Path | None = None,
+    extra_args: Optional[list[str]] = None,
+    output_map: Optional[Dict[str, str]] = None,
+) -> GenericEpisodeFunction:
+    """Wrap a simulation script that prints one JSON output dictionary."""
+    script_path = Path(script_path)
+    executable = str(python_executable or sys.executable)
+    param_names = param_names or ["contraction", "contraction_velocity"]
+    extra_args = extra_args or []
+    output_map = output_map or {}
+
+    def run_script_episode(*args, **kwargs) -> SimOutputs:
+        if len(args) == 3 and not kwargs:
+            params = {
+                param_names[0]: float(args[0]),
+                param_names[1]: float(args[1]),
+            }
+            n_beats = int(args[2])
+        else:
+            n_beats = int(kwargs.pop("n_beats"))
+            params = {name: float(kwargs[name]) for name in param_names}
+
         cmd = [
             executable,
             str(script_path),
-            "--contraction",
-            str(contraction),
-            "--contraction-velocity",
-            str(contraction_velocity),
             "--n-beats",
             str(n_beats),
             *extra_args,
         ]
+        for name, value in params.items():
+            cmd.extend([f"--{name.replace('_', '-')}", str(value)])
         completed = subprocess.run(
             cmd,
             check=True,
             capture_output=True,
             text=True,
         )
-        outputs = json.loads(completed.stdout)
+        outputs = _parse_json_stdout(completed.stdout)
         if not isinstance(outputs, dict):
             raise TypeError("Simulation script must print a JSON object.")
         if output_map:
@@ -271,3 +325,29 @@ def make_script_episode_function(
         return {k: float(v) for k, v in outputs.items()}
 
     return run_script_episode
+
+
+def _parse_json_stdout(stdout: str) -> object:
+    """Accept pure JSON stdout or a final JSON line after logs."""
+    text = stdout.strip()
+    if not text:
+        raise ValueError("Simulation script printed no JSON output.")
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    for line in reversed(text.splitlines()):
+        try:
+            return json.loads(line.strip())
+        except json.JSONDecodeError:
+            continue
+
+    raise ValueError("Simulation script must print a JSON object.")
+
+
+# Backward-compatible aliases for older scripts.
+SimulatorBridge = SimulatorAdapter
+FunctionBridge = FunctionAdapter
+MockBridge = MockSimulation

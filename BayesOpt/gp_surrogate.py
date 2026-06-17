@@ -97,7 +97,7 @@ class GPSurrogate:
         Parameters
         ----------
         X      : (n, d) parameter matrix
-        y      : (n,)  objective values
+        y      : (n,)  score values
         bounds : (d, 2) parameter bounds [[lo, hi], ...] for normalisation.
                  If None, uses column-wise min/max of X (may be unreliable with few points).
         """
