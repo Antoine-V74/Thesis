@@ -1,7 +1,7 @@
 """Detection metrics and timing summaries for R-peak benchmarks."""
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -39,6 +39,7 @@ def summarize_detection(
     n_det: int,
     n_matched: int,
     timing_errors_s: np.ndarray,
+    confirmation_timing_errors_s: Optional[np.ndarray],
     duration_s: float,
     processing_ms: float,
     result: RPeakDetectionResult,
@@ -80,6 +81,28 @@ def summarize_detection(
         float(np.percentile(abs_timing_ms, 95)) if len(abs_timing_ms) else float("nan")
     )
 
+    conf_timing_ms = np.array([], dtype=float)
+    if (
+        result.is_causal
+        and has_explicit_confirmation
+        and confirmation_timing_errors_s is not None
+        and len(confirmation_timing_errors_s)
+    ):
+        conf_timing_ms = confirmation_timing_errors_s.astype(float) * 1000.0
+
+    mean_confirmed_event_lag_ms = (
+        float(np.mean(conf_timing_ms)) if len(conf_timing_ms) else float("nan")
+    )
+    median_confirmed_event_lag_ms = (
+        float(np.median(conf_timing_ms)) if len(conf_timing_ms) else float("nan")
+    )
+    p95_confirmed_event_lag_ms = (
+        float(np.percentile(conf_timing_ms, 95)) if len(conf_timing_ms) else float("nan")
+    )
+    mean_abs_confirmed_event_error_ms = (
+        float(np.mean(np.abs(conf_timing_ms))) if len(conf_timing_ms) else float("nan")
+    )
+
     n_samples = max(int(duration_s * float(fs)), 1)
     processing_ms_per_sample = processing_ms / n_samples
     processing_ms_per_second_signal = processing_ms / max(duration_s, 1e-9)
@@ -101,6 +124,10 @@ def summarize_detection(
         "mean_detection_lag_ms": round(mean_detection_lag_ms, 2),
         "median_detection_lag_ms": round(median_detection_lag_ms, 2),
         "p95_detection_lag_ms": round(p95_detection_lag_ms, 2),
+        "mean_confirmed_event_lag_ms": round(mean_confirmed_event_lag_ms, 2),
+        "median_confirmed_event_lag_ms": round(median_confirmed_event_lag_ms, 2),
+        "p95_confirmed_event_lag_ms": round(p95_confirmed_event_lag_ms, 2),
+        "mean_abs_confirmed_event_error_ms": round(mean_abs_confirmed_event_error_ms, 2),
         "mean_abs_timing_error_ms": round(mean_abs_timing_error_ms, 2),
         "median_abs_timing_error_ms": round(median_abs_timing_error_ms, 2),
         "p95_abs_timing_error_ms": round(p95_abs_timing_error_ms, 2),

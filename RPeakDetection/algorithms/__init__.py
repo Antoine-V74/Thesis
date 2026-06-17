@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Dict, List
 
+from RPeakDetection.algorithms.ampt import AmptDetector
 from RPeakDetection.algorithms.adaptive_threshold import AdaptiveThresholdDetector
 from RPeakDetection.algorithms.base import RPeakDetector
 from RPeakDetection.algorithms.ecg_detectors import (
@@ -15,6 +16,7 @@ from RPeakDetection.algorithms.ecg_detectors import (
 
 _ALGORITHM_CLASSES = {
     "adaptive_threshold": AdaptiveThresholdDetector,
+    "ampt": AmptDetector,
     "hamilton": HamiltonDetector,
     "christov": ChristovDetector,
     "pan_tompkins": PanTompkinsDetector,

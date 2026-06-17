@@ -15,7 +15,10 @@ venv/
 ENV/
 
 # Local datasets and generated outputs (re-download / re-run locally)
-data/
+# Keep only the dataset registry and download notes in Git; never commit WFDB data.
+data/*
+!data/README.md
+!data/dataset_registry.py
 Results/
 
 # IDE / editor

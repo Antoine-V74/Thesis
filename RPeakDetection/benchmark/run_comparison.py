@@ -35,7 +35,7 @@ _DATA = _ROOT / "data"
 sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_DATA))
 
-from dataset_registry import dataset_dir, resolve_dataset  # noqa: E402
+from dataset_registry import dataset_dir, is_beat_symbol, resolve_dataset  # noqa: E402
 from RPeakDetection.algorithms import DEFAULT_ALGORITHMS, get_detector, list_algorithms  # noqa: E402
 from RPeakDetection.benchmark.metrics import greedy_match, summarize_detection  # noqa: E402
 
@@ -62,17 +62,16 @@ def should_include_record(dataset_folder: str, record_stem: str, nstdb_min_snr: 
     return snr >= nstdb_min_snr
 
 
-def beat_label(symbol: str, dataset: str) -> str:
+def dataset_rpeak_skip_reason(dataset: str, include_nondefault: bool) -> Optional[str]:
     info = resolve_dataset(dataset)
-    if info.group == "vt_vfib":
-        return "abnormal_v"
-    if info.folder == "noise_stress_test":
-        return "abnormal_noise"
-    if symbol in info.normal_beats:
-        return "healthy"
-    if symbol in info.abnormal_beats:
-        return "abnormal_v"
-    return "mixed"
+    if info.rpeak_ann_ext is None:
+        return f"{info.folder}: {info.rpeak_notes}"
+    if not info.rpeak_benchmark_default and not include_nondefault:
+        return (
+            f"{info.folder}: non-default R-peak reference "
+            f"({info.rpeak_reference}). {info.rpeak_notes}"
+        )
+    return None
 
 
 def load_reference_beats(
@@ -81,10 +80,13 @@ def load_reference_beats(
     fs: float,
     max_time_s: Optional[float] = None,
 ) -> Tuple[List[float], int]:
-    ann = wfdb.rdann(str(stem), resolve_dataset(dataset).ann_ext)
+    info = resolve_dataset(dataset)
+    if info.rpeak_ann_ext is None:
+        raise ValueError(f"{info.folder} has no beat-level R-peak annotation extension")
+    ann = wfdb.rdann(str(stem), info.rpeak_ann_ext)
     ref_s: List[float] = []
     for sample, sym in zip(ann.sample, ann.symbol):
-        if beat_label(sym, dataset) == "mixed":
+        if not is_beat_symbol(sym):
             continue
         t = sample / fs
         if max_time_s is not None and t > max_time_s:
@@ -114,17 +116,26 @@ def benchmark_one(
 
     matches, _, _ = greedy_match(ref_s, det_s, match_tol_s)
     timing_errors = np.array([err for _, _, err in matches], dtype=float)
+    conf_s = result.confirmation_times_s(fs)
+    confirmation_timing_errors = np.array([], dtype=float)
+    if len(conf_s) == len(det_s):
+        confirmation_timing_errors = np.array(
+            [float(conf_s[j] - ref_s[i]) for i, j, _ in matches],
+            dtype=float,
+        )
 
     summary = summarize_detection(
         n_ref=len(ref_s),
         n_det=len(det_s),
         n_matched=len(matches),
         timing_errors_s=timing_errors,
+        confirmation_timing_errors_s=confirmation_timing_errors,
         duration_s=duration_s,
         processing_ms=processing_ms,
         result=result,
         fs=fs,
     )
+    info = resolve_dataset(dataset)
     return {
         "algorithm": algorithm,
         "dataset": dataset,
@@ -132,7 +143,10 @@ def benchmark_one(
         "duration_s": round(duration_s, 1),
         "fs_hz": fs,
         "match_tol_ms": round(match_tol_s * 1000.0, 1),
+        "annotation_ext": info.rpeak_ann_ext,
+        "annotation_reference": info.rpeak_reference,
         "notes": result.notes,
+        "snr_db": nstdb_record_snr(stem.name),
         **summary,
     }
 
@@ -141,7 +155,10 @@ def aggregate_algorithm(rows: pd.DataFrame) -> Dict:
     n_ref = int(rows["n_annotated_beats"].sum())
     n_det = int(rows["n_detected_peaks"].sum())
     n_matched = int(rows["n_matched"].sum())
-    dur = float(rows["duration_s"].sum())
+    if "total_duration_s" in rows.columns:
+        dur = float(rows["total_duration_s"].sum())
+    else:
+        dur = float(rows["duration_s"].sum())
     sens = n_matched / n_ref if n_ref else float("nan")
     ppv = n_matched / n_det if n_det else float("nan")
     f1 = 2 * sens * ppv / (sens + ppv) if sens + ppv > 0 else float("nan")
@@ -158,8 +175,17 @@ def aggregate_algorithm(rows: pd.DataFrame) -> Dict:
             return float(np.nanmean(vals))
         return float(np.average(vals[mask], weights=weights[mask]))
 
+    if "processing_ms" in rows.columns:
+        mean_processing_ms_per_record = float(rows["processing_ms"].mean())
+        total_processing_ms = float(rows["processing_ms"].sum())
+    else:
+        mean_processing_ms_per_record = float(rows["mean_processing_ms_per_record"].mean())
+        total_processing_ms = float(
+            (rows["mean_processing_ms_per_record"].astype(float) * rows["n_records"].astype(float)).sum()
+        )
+
     return {
-        "n_records": len(rows),
+        "n_records": int(rows["n_records"].sum()) if "n_records" in rows.columns else len(rows),
         "total_duration_s": round(dur, 1),
         "n_annotated_beats": n_ref,
         "n_detected_peaks": n_det,
@@ -172,14 +198,19 @@ def aggregate_algorithm(rows: pd.DataFrame) -> Dict:
         "extra_peaks_per_hour": round((n_det - n_matched) / max(dur / 3600.0, 1e-9), 2),
         "mean_confirmation_delay_ms": round(_wmean("mean_confirmation_delay_ms"), 2),
         "median_confirmation_delay_ms": round(_wmean("median_confirmation_delay_ms"), 2),
+        "p95_confirmation_delay_ms": round(_wmean("p95_confirmation_delay_ms"), 2),
         "mean_detection_lag_ms": round(_wmean("mean_detection_lag_ms"), 2),
         "median_detection_lag_ms": round(_wmean("median_detection_lag_ms"), 2),
         "p95_detection_lag_ms": round(_wmean("p95_detection_lag_ms"), 2),
+        "mean_confirmed_event_lag_ms": round(_wmean("mean_confirmed_event_lag_ms"), 2),
+        "median_confirmed_event_lag_ms": round(_wmean("median_confirmed_event_lag_ms"), 2),
+        "p95_confirmed_event_lag_ms": round(_wmean("p95_confirmed_event_lag_ms"), 2),
+        "mean_abs_confirmed_event_error_ms": round(_wmean("mean_abs_confirmed_event_error_ms"), 2),
         "mean_abs_timing_error_ms": round(_wmean("mean_abs_timing_error_ms"), 2),
         "median_abs_timing_error_ms": round(_wmean("median_abs_timing_error_ms"), 2),
-        "mean_processing_ms_per_record": round(float(rows["processing_ms"].mean()), 2),
+        "mean_processing_ms_per_record": round(mean_processing_ms_per_record, 2),
         "mean_processing_ms_per_second_signal": round(
-            float(rows["processing_ms"].sum() / max(dur, 1e-9)), 4
+            total_processing_ms / max(dur, 1e-9), 4
         ),
         "is_causal": bool(rows["is_causal"].iloc[0]) if len(rows) else False,
         "uses_prefilter": bool(rows["uses_prefilter"].iloc[0]) if len(rows) else False,
@@ -202,17 +233,49 @@ def build_algorithm_summaries(per_algo_dataset: pd.DataFrame) -> Tuple[pd.DataFr
             "has_explicit_confirmation": agg["has_explicit_confirmation"],
             "mean_confirmation_delay_ms": agg["mean_confirmation_delay_ms"],
             "median_confirmation_delay_ms": agg["median_confirmation_delay_ms"],
+            "p95_confirmation_delay_ms": agg["p95_confirmation_delay_ms"],
             "mean_detection_lag_ms": agg["mean_detection_lag_ms"],
             "median_detection_lag_ms": agg["median_detection_lag_ms"],
             "p95_detection_lag_ms": agg["p95_detection_lag_ms"],
+            "mean_confirmed_event_lag_ms": agg["mean_confirmed_event_lag_ms"],
+            "median_confirmed_event_lag_ms": agg["median_confirmed_event_lag_ms"],
+            "p95_confirmed_event_lag_ms": agg["p95_confirmed_event_lag_ms"],
+            "mean_abs_confirmed_event_error_ms": agg["mean_abs_confirmed_event_error_ms"],
             "mean_abs_timing_error_ms": agg["mean_abs_timing_error_ms"],
             "median_abs_timing_error_ms": agg["median_abs_timing_error_ms"],
             "notes": (
-                "detection_lag_ms: matched reported peak minus annotation (benchmark only). "
-                "Stim command time = detector event time + policy offset (e.g. R_est + 50 ms)."
+                "detection_lag_ms: matched reported peak minus annotation. "
+                "confirmed_event_lag_ms: live confirmation event minus annotation for causal detectors. "
+                "Stim command time = confirmed event time + policy offset when using confirmed causal output."
             ),
         })
     return pd.DataFrame(algo_rows), pd.DataFrame(timing_rows)
+
+
+def build_macro_summary(per_algo_dataset: pd.DataFrame) -> pd.DataFrame:
+    """Mean of per-dataset metrics, so large datasets do not dominate the table."""
+    if per_algo_dataset.empty:
+        return pd.DataFrame()
+
+    valid = per_algo_dataset[per_algo_dataset["n_annotated_beats"].astype(float) > 0]
+    rows: List[Dict] = []
+    for algorithm, grp in valid.groupby("algorithm"):
+        row = {"algorithm": algorithm, "n_datasets": int(grp["dataset"].nunique())}
+        for col in (
+            "sensitivity",
+            "ppv",
+            "f1",
+            "extra_peaks_per_hour",
+            "mean_detection_lag_ms",
+            "mean_confirmed_event_lag_ms",
+            "mean_abs_timing_error_ms",
+            "mean_abs_confirmed_event_error_ms",
+        ):
+            if col in grp.columns:
+                vals = grp[col].astype(float)
+                row[f"macro_{col}"] = round(float(vals.mean()), 4)
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def write_summaries(
@@ -252,6 +315,24 @@ def write_summaries(
     algo_summary, timing_summary = build_algorithm_summaries(per_algo_dataset)
     algo_summary.to_csv(out_dir / "algorithm_summary.csv", index=False)
     timing_summary.to_csv(out_dir / "timing_summary.csv", index=False)
+    build_macro_summary(per_algo_dataset).to_csv(out_dir / "macro_algorithm_summary.csv", index=False)
+
+    if not per_record.empty and "snr_db" in per_record.columns:
+        snr_rows: List[Dict] = []
+        snr_df = per_record[per_record["snr_db"].notna()]
+        for (algorithm, dataset, snr_db), grp in snr_df.groupby(["algorithm", "dataset", "snr_db"]):
+            agg = aggregate_algorithm(grp)
+            snr_rows.append({
+                "algorithm": algorithm,
+                "dataset": dataset,
+                "snr_db": int(float(snr_db)),
+                **agg,
+            })
+        snr_path = out_dir / "per_algorithm_per_snr.csv"
+        if snr_rows:
+            pd.DataFrame(snr_rows).to_csv(snr_path, index=False)
+        elif snr_path.exists():
+            snr_path.unlink()
 
 
 def run_comparison(args: argparse.Namespace) -> None:
@@ -269,7 +350,17 @@ def run_comparison(args: argparse.Namespace) -> None:
     tol_s = args.match_tol_ms / 1000.0
     per_record_rows: List[Dict] = []
 
-    datasets = [resolve_dataset(d).folder for d in args.datasets]
+    datasets: List[str] = []
+    skipped_datasets: List[Dict[str, str]] = []
+    for d in args.datasets:
+        info = resolve_dataset(d)
+        reason = dataset_rpeak_skip_reason(info.folder, args.include_nondefault_annotations)
+        if reason is not None:
+            logging.warning("Skipping %s", reason)
+            skipped_datasets.append({"dataset": info.folder, "reason": reason})
+            continue
+        datasets.append(info.folder)
+
     for dataset in datasets:
         ds_dir = dataset_dir(args.data_dir, dataset)
         hea_files = sorted(ds_dir.glob("*.hea"))
@@ -334,6 +425,8 @@ def run_comparison(args: argparse.Namespace) -> None:
     config = {
         **{k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
         "available_algorithms": list_algorithms(),
+        "included_datasets": datasets,
+        "skipped_datasets": skipped_datasets,
     }
     with open(args.out_dir / "run_config.json", "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
@@ -365,6 +458,14 @@ def main(argv=None) -> None:
         "--write-per-record",
         action="store_true",
         help="Write per_record.csv (large). Default: summary CSVs only.",
+    )
+    p.add_argument(
+        "--include-nondefault-annotations",
+        action="store_true",
+        help=(
+            "Also score datasets whose R-peak references are secondary or explicitly "
+            "non-definitive. Rhythm-only datasets are still skipped."
+        ),
     )
     p.add_argument(
         "--merge-per-dataset",
