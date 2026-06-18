@@ -1,0 +1,7 @@
+dataset,dataset_label,n_records,n_annotated_beats,sensitivity,ppv,f1,median_confirmed_event_lag_ms,p95_confirmed_event_lag_ms,extra_peaks_per_hour,main_note
+mit_bih_arrhythmia,MIT-BIH,48,109150,0.9933,0.951,0.9717,41.91,53.08,232.54,strong development-set performance
+normal_sinus_rhythm,NSRDB,16,38412,0.9984,0.9459,0.9714,49.06,55.64,274.38,strong on mostly sinus rhythm
+noise_stress_test,NSTDB,6,12756,0.9973,0.9483,0.9722,72.26,75.03,231.0,robust at SNR >= 12 dB
+long_term_atrial_fibrillation,LTAFDB,40,89557,0.9965,0.8148,0.8965,39.19,59.01,1014.0,"high sensitivity, many extra peaks"
+supraventricular_arrhythmia,SVDB,78,184583,0.9196,0.8775,0.898,45.34,56.78,607.82,bad-tail failures dominate
+st_petersburg_12lead,INCART,74,173544,0.9685,0.8761,0.92,33.28,52.65,642.54,domain and lead morphology shift

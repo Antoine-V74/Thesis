@@ -1,0 +1,21 @@
+dataset,dataset_label,record,f1,ppv,sensitivity,n_extra,n_missed,n_annotated_beats,failure_mode
+supraventricular_arrhythmia,SVDB,868,0.0027,0.0027,0.0027,3348,3339,3348,catastrophic mismatch
+supraventricular_arrhythmia,SVDB,869,0.0051,0.0051,0.0051,2148,2150,2161,catastrophic mismatch
+supraventricular_arrhythmia,SVDB,891,0.099,0.0987,0.0994,2366,2347,2606,catastrophic mismatch
+supraventricular_arrhythmia,SVDB,880,0.1075,0.1075,0.1075,3114,3112,3487,catastrophic mismatch
+supraventricular_arrhythmia,SVDB,885,0.3887,0.3753,0.4031,1315,1170,1960,misses and extra peaks
+st_petersburg_12lead,INCART,I03,0.4562,0.32,0.7945,4140,504,2452,misses and extra peaks
+supraventricular_arrhythmia,SVDB,865,0.5197,0.3968,0.753,3620,781,3162,misses and extra peaks
+st_petersburg_12lead,INCART,I05,0.5298,0.4294,0.6914,1632,548,1776,misses and extra peaks
+long_term_atrial_fibrillation,LTAFDB,120,0.5794,0.4079,1.0,2189,0,1508,extra peaks dominate
+long_term_atrial_fibrillation,LTAFDB,00,0.6196,0.4533,0.9785,1593,29,1350,extra peaks dominate
+long_term_atrial_fibrillation,LTAFDB,119,0.6419,0.4726,1.0,1012,0,907,extra peaks dominate
+mit_bih_arrhythmia,MIT-BIH,113,0.6668,0.5004,0.9989,1784,2,1789,extra peaks dominate
+supraventricular_arrhythmia,SVDB,851,0.6858,0.6557,0.7188,992,739,2628,misses and extra peaks
+long_term_atrial_fibrillation,LTAFDB,101,0.6923,0.5327,0.9884,1723,23,1987,extra peaks dominate
+st_petersburg_12lead,INCART,I51,0.6985,0.6855,0.7119,907,800,2777,misses and extra peaks
+st_petersburg_12lead,INCART,I04,0.7172,0.6535,0.7946,1021,498,2424,misses and extra peaks
+st_petersburg_12lead,INCART,I44,0.7276,0.7273,0.7279,681,679,2495,misses and extra peaks
+st_petersburg_12lead,INCART,I09,0.7313,0.5769,0.9983,2194,5,2997,extra peaks dominate
+st_petersburg_12lead,INCART,I56,0.7555,0.6208,0.9648,1005,60,1705,extra peaks dominate
+long_term_atrial_fibrillation,LTAFDB,54,0.7564,0.6085,0.9994,1050,1,1633,extra peaks dominate

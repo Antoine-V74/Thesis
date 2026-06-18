@@ -74,6 +74,22 @@ This is a development result, not a final scientific claim. Since the parameter
 choice was checked on MIT-BIH, final reporting should also validate on the other
 default datasets, especially NSTDB and INCART.
 
+## Report Assets
+
+GitHub-ready summary figures and compact CSV tables are stored in:
+
+```text
+reports/rpeak_detection/
+```
+
+Regenerate them from the latest benchmark with:
+
+```powershell
+python RPeakDetection\benchmark\make_report_assets.py `
+    --results-dir Results\rpeak_comparison\adaptive_v2_default_datasets_20260618 `
+    --out-dir reports\rpeak_detection
+```
+
 ## Annotation Policy
 
 R-peak detection is scored only against beat/QRS annotations. Rhythm markers

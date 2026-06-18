@@ -11,6 +11,11 @@ Good candidates:
 - links to archived full outputs on Zenodo, OSF, institutional storage, or
   GitHub Releases
 
+Current reports:
+
+- `rpeak_detection/`: compact `adaptive_threshold_v2` R-peak benchmark figures,
+  worst-record tables, and ECG overlay examples.
+
 Do not use this folder for raw PhysioNet data, full per-beat exports, model
 checkpoints, or large generated logs. Those belong in local `Results/` or in an
 external archive.
