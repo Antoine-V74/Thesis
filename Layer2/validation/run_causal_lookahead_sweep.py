@@ -4,7 +4,8 @@ Sweep causal Layer 2 post-R lookahead for the fast causal threshold detector.
 Each sweep point uses:
   - causal Layer 2 features: [R - morphology_window_s, R + lookahead]
   - oracle eval mode as the upper-bound trigger source
-  - fast_causal_gated / adaptive_candidate_fast_context / nextbeat / stateful as deployment modes
+  - fast_causal_gated / adaptive_candidate_fast_context / nextbeat / stateful
+    / prospective 1-in-8 cadence as deployment modes
 
 Outputs are written under one folder per lookahead plus combined CSV summaries.
 """
@@ -34,6 +35,7 @@ def _comparison_from_overall(overall: pd.DataFrame, lookahead_ms: int) -> pd.Dat
         "adaptive_candidate_fast_context",
         "fast_causal_nextbeat",
         "fast_causal_stateful",
+        "fast_causal_cadence_1of8",
     ]
     overall = overall[
         (overall["benchmark_mode"] == "zero_shot")
@@ -81,6 +83,7 @@ def _nstdb_filtered(per_beat_path: Path, lookahead_ms: int, min_snr: int) -> pd.
             "adaptive_candidate_fast_context",
             "fast_causal_nextbeat",
             "fast_causal_stateful",
+            "fast_causal_cadence_1of8",
         ]))
     ].copy()
     df["snr_db"] = df["record"].map(nstdb_snr)
@@ -140,6 +143,9 @@ def main(argv=None) -> None:
             feature_window_mode="causal",
             post_r_lookahead_s=look_ms / 1000.0,
             max_records_per_dataset=args.max_records_per_dataset,
+            cadence_observation_lookahead_s=0.40,
+            cadence_min_safe_observations=6,
+            cadence_require_last_observation_safe=True,
         )
         overall = pd.read_csv(run_dir / "overall_summary.csv")
         comparisons.append(_comparison_from_overall(overall, look_ms))

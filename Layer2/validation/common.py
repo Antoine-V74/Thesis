@@ -7,7 +7,6 @@ filtering, scoring wrappers, feature alignment, and calibrator fitting.
 """
 from __future__ import annotations
 
-import importlib.util
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -19,6 +18,7 @@ _HERE = Path(__file__).resolve().parent
 _L2 = _HERE.parent
 _ROOT = _L2.parent
 _DATA = _ROOT / "data"
+sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_L2))
 sys.path.insert(0, str(_DATA))
 
@@ -34,27 +34,7 @@ from decision import (  # noqa: E402
     RRReliabilityConfig,
     check_rr_reliability,
 )
-
-_L1 = _ROOT / "Layer1"
-_l1_bootstrap = importlib.util.spec_from_file_location(
-    "layer1_bootstrap", _L1 / "_bootstrap.py",
-)
-if _l1_bootstrap is None or _l1_bootstrap.loader is None:
-    raise ImportError("Cannot load Layer1 bootstrap")
-layer1_bootstrap = importlib.util.module_from_spec(_l1_bootstrap)
-_l1_bootstrap.loader.exec_module(layer1_bootstrap)
-sys.path.insert(0, str(_L1))
-setup_layer1_paths = layer1_bootstrap.setup_layer1_paths
-setup_layer1_paths(include_archive=True)
-
-try:
-    from main_pipeline import layer1_r_peaks as _layer1_r_peaks
-    from main_pipeline import layer1_detector_peaks
-    _LAYER1_AVAILABLE = True
-except ImportError:
-    _layer1_r_peaks = None
-    layer1_detector_peaks = None
-    _LAYER1_AVAILABLE = False
+from RPeakDetection.algorithms import get_detector  # noqa: E402
 
 
 CALIBRATION_RECORDS = {"100", "101", "103", "115", "117", "121", "122"}
@@ -87,11 +67,18 @@ def apply_filters(raw: np.ndarray, fs: float) -> np.ndarray:
     return filt
 
 
-def layer1_r_peaks(filt: np.ndarray, fs: float) -> np.ndarray:
-    """Fast causal detector + RR supervisor. Returns accepted peaks in seconds."""
-    if not _LAYER1_AVAILABLE or _layer1_r_peaks is None:
-        return np.array([])
-    return _layer1_r_peaks(filt, fs)
+DEFAULT_CAUSAL_RPEAK_ALGORITHM = "adaptive_threshold_v2"
+
+
+def rpeak_detector_peaks(
+    raw: np.ndarray,
+    fs: float,
+    algorithm: str = DEFAULT_CAUSAL_RPEAK_ALGORITHM,
+) -> np.ndarray:
+    """R-peak timestamps in seconds from the RPeakDetection registry."""
+    result = get_detector(algorithm).detect(np.asarray(raw, dtype=float), fs)
+    return result.peak_times_s(fs)
+
 
 
 def align_features_for_scoring(

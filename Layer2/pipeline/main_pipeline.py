@@ -7,6 +7,11 @@ Workflow:
         -> calibrate_layer2()   # session start, on healthy windows
         -> decide_layer2()      # runtime permit/inhibit
 
+For prospective stimulation, use ProspectiveCadenceGate around decide_layer2():
+observe 7 unstimulated beats, then apply that precomputed safety state to beat
+8. The default cadence policy requires at least 6 safe observations and a safe
+7th observation. Beat 8 only needs R-peak detection at trigger time.
+
 R-peaks are optional in the API so signal-only features (wavelets, entropy,
 SQI, amplitude) still work when peak detection fails. Without R-peaks, rr__
 and morph__ features are omitted and rhythm/morphology gates cannot fire.
@@ -20,6 +25,7 @@ import numpy as np
 
 from decision import BaselineCalibrator
 from full_features import full_features
+from stimulation_cadence import ProspectiveCadenceGate
 
 
 FeatureDict = Dict[str, float]
@@ -99,6 +105,7 @@ __all__ = [
     "BaselineCalibrator",
     "DecisionDict",
     "FeatureDict",
+    "ProspectiveCadenceGate",
     "calibrate_layer2",
     "decide_layer2",
     "extract_layer2_features",

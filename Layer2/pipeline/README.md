@@ -9,6 +9,16 @@ ECG window + R-peaks
   -> decide_layer2()        # runtime
 ```
 
+Prospective stimulation path:
+
+```text
+beats 1-7: extract features -> Layer 2 permit/inhibit -> update cadence state
+beat 8:    use stored cadence state + R-peak detection -> trigger or inhibit
+```
+
+Observation beats can use a longer causal post-R lookahead because the decision
+is only consumed at beat 8. The 8th beat itself remains trigger-only.
+
 Start from `main_pipeline.py`. Use `Layer2/validation/` for dataset benchmarks.
 
 ## Feature extraction
@@ -16,6 +26,7 @@ Start from `main_pipeline.py`. Use `Layer2/validation/` for dataset benchmarks.
 | File | Purpose |
 |------|---------|
 | `main_pipeline.py` | Public API: extract, calibrate, decide |
+| `stimulation_cadence.py` | Prospective 1-in-8 stimulation policy |
 | `full_features.py` | Assembles all features into one dict |
 | `signal_features.py` | Wavelets, entropy (no R-peaks needed) |
 | `morphology_features.py` | Beat shape / template features |
@@ -93,3 +104,15 @@ hard rules
 
 Use at each stimulation trigger when RR peak detection quality varies and
 you need to separate "bad rhythm" from "unreliable RR history after artifact".
+
+### `stimulation_cadence.py` - prospective 1-in-8 stimulation
+
+`ProspectiveCadenceGate` implements the current therapy timing assumption:
+stimulate only one accepted R-peak out of eight.
+
+```text
+observe 7 beats -> require at least 6 safe, with beat 7 safe -> candidate beat 8
+```
+
+The candidate beat is not analyzed by Layer 2 before stimulation. At beat 8 the
+runtime only needs a valid R-peak trigger and the precomputed cadence decision.

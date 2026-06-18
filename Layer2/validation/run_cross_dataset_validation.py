@@ -50,7 +50,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import logging
 import sys
 import time
@@ -60,40 +59,29 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+try:
+    from scipy.signal import butter, iirnotch, lfilter
+    _SCIPY_OK = True
+except ImportError:
+    _SCIPY_OK = False
+
 _HERE = Path(__file__).resolve().parent
 _L2 = _HERE.parent
 _ROOT = _L2.parent
 _DATA = _ROOT / "data"
+sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_L2))
 sys.path.insert(0, str(_DATA))
 from _bootstrap import setup_layer2_paths  # noqa: E402
 
 setup_layer2_paths()
 
-_L1 = _ROOT / "Layer1"
-_l1_bootstrap = importlib.util.spec_from_file_location(
-    "layer1_bootstrap", _L1 / "_bootstrap.py",
-)
-if _l1_bootstrap is None or _l1_bootstrap.loader is None:
-    raise ImportError("Cannot load Layer1 bootstrap")
-layer1_bootstrap = importlib.util.module_from_spec(_l1_bootstrap)
-_l1_bootstrap.loader.exec_module(layer1_bootstrap)
-sys.path.insert(0, str(_L1))
-setup_layer1_paths = layer1_bootstrap.setup_layer1_paths
-setup_layer1_paths(include_archive=True)
-
 from full_features import full_features
 from decision import BaselineCalibrator, FROZEN_COUPLING_THRESHOLD
-from common import apply_filters, layer1_r_peaks, score_one, score_one_hybrid
+from stimulation_cadence import ProspectiveCadenceGate
+from common import DEFAULT_CAUSAL_RPEAK_ALGORITHM, apply_filters, score_one, score_one_hybrid
 from common import _fit_calibrator, _select_finite_features, align_features_for_scoring
-
-_ADAPTIVE_OK = False
-
-try:
-    from main_pipeline import filter_ecg, layer1_detector_peaks, layer1_r_peaks
-    _FAST_CAUSAL_OK = True
-except ImportError:
-    _FAST_CAUSAL_OK = False
+from RPeakDetection.algorithms import get_detector
 
 try:
     import wfdb
@@ -170,10 +158,20 @@ def _causal_notch(x: np.ndarray, fs: float, f0: float, q: float = 30.0) -> np.nd
 
 def fast_causal_r_peaks(raw: np.ndarray, fs: float) -> np.ndarray:
     """Causal-filtered fast detector peaks in seconds (no RR supervisor)."""
-    if not _FAST_CAUSAL_OK:
-        return np.array([], dtype=float)
-    filt_causal = filter_ecg(raw, fs, mode="causal")
-    return layer1_detector_peaks(filt_causal, fs)
+    result = get_detector(DEFAULT_CAUSAL_RPEAK_ALGORITHM).detect(np.asarray(raw, dtype=float), fs)
+    return result.peak_times_s(fs)
+
+
+def fast_causal_r_peak_events(
+    raw: np.ndarray,
+    fs: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return detector peak estimates, confirmation times, and confirmation delays."""
+    result = get_detector(DEFAULT_CAUSAL_RPEAK_ALGORITHM).detect(np.asarray(raw, dtype=float), fs)
+    peak_s = result.peak_times_s(fs)
+    confirmation_s = result.confirmation_times_s(fs)
+    delay_ms = np.asarray(result.confirmation_delays_ms, dtype=float)
+    return peak_s, confirmation_s, delay_ms
 
 
 def fast_same_beat_ok(
@@ -283,6 +281,8 @@ def _persistent_risk_state_update(
 
 def causal_layer2_filter(raw: np.ndarray, fs: float) -> np.ndarray:
     """Causal ECG filter used for deployment-style Layer 2 feature extraction."""
+    if not _SCIPY_OK:
+        return np.asarray(raw, dtype=float)
     filt_causal = _causal_bandpass(raw, fs)
     if fs > 110:
         filt_causal = _causal_notch(filt_causal, fs, 50.0)
@@ -425,6 +425,9 @@ def evaluate_record(
     include_adaptive: bool,
     feature_window_mode: str,
     post_r_lookahead_s: float,
+    cadence_observation_lookahead_s: float,
+    cadence_min_safe_observations: int,
+    cadence_require_last_observation_safe: bool,
 ) -> List[Dict]:
     try:
         rec = wfdb.rdrecord(stem)
@@ -444,13 +447,11 @@ def evaluate_record(
         if sym in (DATASET_NORMAL[dataset] | DATASET_ABNORMAL[dataset])
     ], dtype=float)
 
-    # Layer 1 peaks (realistic mode)
-    l1_peaks = layer1_r_peaks(filt, fs)
-    ad_peaks = (
-        adaptive_layer1_r_peaks(filt, fs, deployment_adaptive_config())
-        if include_adaptive and _ADAPTIVE_OK else np.array([])
+    # RPeakDetection trigger streams.
+    ad_peaks = np.array([], dtype=float)
+    fast_peaks, fast_confirmations, fast_confirmation_delays_ms = (
+        fast_causal_r_peak_events(raw, fs)
     )
-    fast_peaks = fast_causal_r_peaks(raw, fs) if _FAST_CAUSAL_OK else np.array([])
 
     # --- Calibration from first cal_frac of healthy annotated beats ---
     healthy_times = sorted(
@@ -520,18 +521,33 @@ def evaluate_record(
     # Tolerance for L1 peak → annotation label matching
     tol_s = 0.080
 
-    def _label_at(t_s: float, tol_override_s: Optional[float] = None) -> Tuple[str, str]:
+    def _reference_at(
+        t_s: float,
+        tol_override_s: Optional[float] = None,
+    ) -> Tuple[str, str, float, float, bool]:
         local_tol_s = tol_s if tol_override_s is None else tol_override_s
         best_sym, best_lbl, best_dt = "?", "mixed", tol_s + 1
+        best_ref_s = float("nan")
         for s, sym in zip(ann.sample, ann.symbol):
-            dt = abs(s / fs - t_s)
+            ref_s = s / fs
+            dt = abs(ref_s - t_s)
             if dt < best_dt:
                 best_dt = dt
+                best_ref_s = ref_s
                 best_sym = sym
                 best_lbl = beat_label(sym, dataset)
+        signed_error_ms = (
+            float((t_s - best_ref_s) * 1000.0)
+            if np.isfinite(best_ref_s) else float("nan")
+        )
+        abs_error_ms = abs(signed_error_ms) if np.isfinite(signed_error_ms) else float("nan")
         if best_dt > local_tol_s:
-            return "?", "mixed"
-        return best_sym, best_lbl
+            return "?", "mixed", signed_error_ms, abs_error_ms, False
+        return best_sym, best_lbl, signed_error_ms, abs_error_ms, True
+
+    def _label_at(t_s: float, tol_override_s: Optional[float] = None) -> Tuple[str, str]:
+        sym, lbl, _signed_ms, _abs_ms, _matched = _reference_at(t_s, tol_override_s)
+        return sym, lbl
 
     rows: List[Dict] = []
     rec_name = Path(stem).name
@@ -540,17 +556,24 @@ def evaluate_record(
         beat_time_s: float,
         lbl: str,
         peaks: np.ndarray,
+        *,
+        post_r_lookahead_override_s: Optional[float] = None,
     ) -> Tuple[Dict[str, Dict[str, object]], int]:
         """Return full causal/centered Layer 2 decisions by feature set."""
         decisions: Dict[str, Dict[str, object]] = {}
         if lbl == "healthy" and beat_time_s <= cal_end_t:
             return decisions, 0
+        lookahead_s = (
+            post_r_lookahead_s
+            if post_r_lookahead_override_s is None
+            else float(post_r_lookahead_override_s)
+        )
         feats, n_beats = extract_beat_features(
             filt, fs, beat_time_s, peaks,
             morphology_window_s, rr_lookback_s, species,
             raw=raw,
             feature_window_mode=feature_window_mode,
-            post_r_lookahead_s=post_r_lookahead_s,
+            post_r_lookahead_s=lookahead_s,
         )
         for fset, cal_obj in calibrators.items():
             aligned = align_features_for_scoring(feats, cal_obj)
@@ -597,7 +620,7 @@ def evaluate_record(
         if _score(t_beat, sym, lbl, all_peaks, "oracle"):
             n_scored += 1
         if len(ad_peaks):
-            _score(t_beat, sym, lbl, ad_peaks, "layer1_adaptive_rr_at_beat")
+            _score(t_beat, sym, lbl, ad_peaks, "rpeak_adaptive_extra_rr_at_beat")
 
     # Adaptive L1: one decision per accepted L1 trigger
     if len(ad_peaks):
@@ -606,7 +629,7 @@ def evaluate_record(
             if window_limit and n_trigger_scored >= window_limit:
                 break
             sym, lbl = _label_at(float(t_beat))
-            if _score(float(t_beat), sym, lbl, ad_peaks, "layer1_adaptive_gated"):
+            if _score(float(t_beat), sym, lbl, ad_peaks, "rpeak_adaptive_extra_gated"):
                 n_trigger_scored += 1
 
     # Two-stream therapy architecture:
@@ -624,7 +647,7 @@ def evaluate_record(
                 n_trigger_scored += 1
 
     # Fast causal threshold detector: deployment-style causal threshold triggers.
-    if len(fast_peaks):
+    if len(fast_peaks) and calibrators:
         n_trigger_scored = 0
         for t_beat in fast_peaks:
             if window_limit and n_trigger_scored >= window_limit:
@@ -636,7 +659,7 @@ def evaluate_record(
     # Stateful deployment mode:
     #   current stimulation decision = fast same-beat veto AND previous beat's full Layer 2 state
     #   current full Layer 2 analysis updates the state consumed by the next trigger.
-    if len(fast_peaks):
+    if len(fast_peaks) and calibrators:
         previous_full: Dict[str, Dict[str, object]] = {
             fset: {"permit": False, "reason": "no_previous_full_layer2"}
             for fset in calibrators
@@ -812,6 +835,112 @@ def evaluate_record(
             risk_state.update(next_risk_state)
             n_stateful_scored += 1
 
+    # Prospective 1-in-8 stimulation cadence:
+    #   beats 1-7 update the Layer 2 safety state, beat 8 is the only
+    #   stimulation opportunity. The candidate beat itself is not analyzed
+    #   before the trigger decision.
+    if len(fast_peaks) and calibrators:
+        cadence_gates = {
+            fset: ProspectiveCadenceGate(
+                cycle_length=8,
+                observation_beats=7,
+                min_safe_observations=cadence_min_safe_observations,
+                require_last_observation_safe=cadence_require_last_observation_safe,
+            )
+            for fset in calibrators
+        }
+        cadence_policy = (
+            f"min{cadence_min_safe_observations}of7"
+            f"_lastsafe{int(cadence_require_last_observation_safe)}"
+        )
+        n_cadence_scored = 0
+        for peak_idx, t_beat in enumerate(fast_peaks):
+            if window_limit and n_cadence_scored >= window_limit:
+                break
+            t_float = float(t_beat)
+            sym, lbl, r_lag_ms, r_abs_ms, r_matched = _reference_at(
+                t_float, tol_override_s=0.120
+            )
+
+            # During calibration, stimulation is disabled and the cadence
+            # starts fresh afterwards.
+            if t_float <= cal_end_t:
+                for gate in cadence_gates.values():
+                    gate.reset()
+                continue
+
+            any_gate = next(iter(cadence_gates.values()))
+            is_candidate = any_gate.next_phase == any_gate.cycle_length
+
+            if is_candidate:
+                same_ok, same_reason, coupling_ratio = fast_same_beat_ok(t_float, fast_peaks)
+                confirmation_delay_ms = (
+                    float(fast_confirmation_delays_ms[peak_idx])
+                    if peak_idx < len(fast_confirmation_delays_ms) else float("nan")
+                )
+                confirmation_time_s = (
+                    float(fast_confirmations[peak_idx])
+                    if peak_idx < len(fast_confirmations) else float("nan")
+                )
+                confirmed_lag_ms = (
+                    float(r_lag_ms + confirmation_delay_ms)
+                    if np.isfinite(r_lag_ms) and np.isfinite(confirmation_delay_ms)
+                    else float("nan")
+                )
+                base = {
+                    "dataset": dataset,
+                    "group": DATASET_GROUP.get(dataset, "unknown"),
+                    "record": rec_name,
+                    "beat_time_s": round(t_float, 3),
+                    "beat_symbol": sym,
+                    "label": lbl,
+                    "n_beats_morph_window": np.nan,
+                    "benchmark_mode": mode,
+                    "eval_mode": "fast_causal_cadence_1of8",
+                    "cadence_policy": cadence_policy,
+                    "cadence_observation_lookahead_s": cadence_observation_lookahead_s,
+                    "same_beat_fast_ok": same_ok,
+                    "same_beat_fast_reason": same_reason,
+                    "same_beat_coupling_ratio": coupling_ratio,
+                    "same_beat_fast_used_for_decision": False,
+                    "rpeak_reference_matched": r_matched,
+                    "rpeak_detection_lag_ms": round(r_lag_ms, 2),
+                    "rpeak_abs_timing_error_ms": round(r_abs_ms, 2),
+                    "rpeak_confirmation_delay_ms": round(confirmation_delay_ms, 2),
+                    "rpeak_confirmed_event_lag_ms": round(confirmed_lag_ms, 2),
+                    "rpeak_confirmation_time_s": round(confirmation_time_s, 3),
+                }
+                for fset, gate in cadence_gates.items():
+                    cadence = gate.step(
+                        safety_decision=None,
+                        trigger_ok=True,
+                        trigger_reason="r_peak_detected",
+                    )
+                    row = {**base, "feature_set": fset, **cadence}
+                    row["inhibit_class"] = _classify_inhibit(str(row.get("reason", "")))
+                    row["sqi_inhibit"] = False
+                    rows.append(row)
+                n_cadence_scored += 1
+                continue
+
+            future_peaks = fast_peaks[fast_peaks > (t_float + 0.003)]
+            if len(future_peaks):
+                max_causal_lookahead_s = max(0.0, float(future_peaks[0] - t_float - 0.003))
+            else:
+                max_causal_lookahead_s = float(cadence_observation_lookahead_s)
+            obs_lookahead_s = min(
+                float(cadence_observation_lookahead_s),
+                max_causal_lookahead_s,
+            )
+            current_full, _n_beats = _full_layer2_decisions(
+                t_float,
+                lbl,
+                fast_peaks,
+                post_r_lookahead_override_s=obs_lookahead_s,
+            )
+            for fset, gate in cadence_gates.items():
+                gate.step(current_full.get(fset) if current_full else None)
+
     return rows
 
 
@@ -867,6 +996,9 @@ def run_benchmark(
     feature_window_mode: str,
     post_r_lookahead_s: float,
     max_records_per_dataset: int,
+    cadence_observation_lookahead_s: float,
+    cadence_min_safe_observations: int,
+    cadence_require_last_observation_safe: bool,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "benchmark.log"
@@ -927,6 +1059,9 @@ def run_benchmark(
                     include_adaptive=include_adaptive,
                     feature_window_mode=feature_window_mode,
                     post_r_lookahead_s=post_r_lookahead_s,
+                    cadence_observation_lookahead_s=cadence_observation_lookahead_s,
+                    cadence_min_safe_observations=cadence_min_safe_observations,
+                    cadence_require_last_observation_safe=cadence_require_last_observation_safe,
                 )
                 all_rows.extend(rows)
 
@@ -946,7 +1081,7 @@ def run_benchmark(
     overall.to_csv(out_dir / "overall_summary.csv", index=False)
 
     # Cross-dataset comparison (key table for thesis)
-    # Focus: oracle + layer1_adaptive_gated, feature_set=all, zero_shot
+    # Focus: oracle + RPeakDetection deployment modes, feature_set=all, zero_shot
     pivot_rows = []
     for (ds, em), sub in overall.groupby(["dataset", "eval_mode"]):
         zs = sub[sub["benchmark_mode"] == "zero_shot"]
@@ -1027,16 +1162,16 @@ def run_benchmark(
        "abnormal_inhibit", "false_permit", "svt_inhibit"]]
     log.info("\n" + show.to_string(index=False))
 
-    log.info("\n=== Cross-dataset summary (zero_shot, adaptive L1, all features) ===")
+    log.info("\n=== Cross-dataset summary (zero_shot, adaptive extra candidate, all features) ===")
     show2 = overall[
         (overall["benchmark_mode"] == "zero_shot")
-        & (overall["eval_mode"] == "layer1_adaptive_gated")
+        & (overall["eval_mode"] == "rpeak_adaptive_extra_gated")
         & (overall["feature_set"] == "all")
     ][["dataset", "n_healthy", "n_abnormal", "healthy_permit",
        "abnormal_inhibit", "false_permit", "svt_inhibit"]]
     log.info("\n" + show2.to_string(index=False))
 
-    log.info("\n=== Cross-dataset summary (zero_shot, fast causal L1 + Layer 2, all features) ===")
+    log.info("\n=== Cross-dataset summary (zero_shot, fast causal RPeakDetection + Layer 2, all features) ===")
     show3 = overall[
         (overall["benchmark_mode"] == "zero_shot")
         & (overall["eval_mode"] == "fast_causal_gated")
@@ -1071,6 +1206,15 @@ def run_benchmark(
     ][["dataset", "n_healthy", "n_abnormal", "healthy_permit",
        "abnormal_inhibit", "false_permit", "svt_inhibit"]]
     log.info("\n" + show5.to_string(index=False))
+
+    log.info("\n=== Cross-dataset summary (zero_shot, fast causal prospective 1-in-8 cadence, all features) ===")
+    show6 = overall[
+        (overall["benchmark_mode"] == "zero_shot")
+        & (overall["eval_mode"] == "fast_causal_cadence_1of8")
+        & (overall["feature_set"] == "all")
+    ][["dataset", "n_healthy", "n_abnormal", "healthy_permit",
+       "abnormal_inhibit", "false_permit", "svt_inhibit"]]
+    log.info("\n" + show6.to_string(index=False))
 
     log.info(f"\nDone -> {out_dir}")
 
@@ -1122,6 +1266,27 @@ def main(argv=None) -> None:
         default=0.08,
         help="Causal Layer 2 post-R samples allowed before permit/inhibit decision.",
     )
+    p.add_argument(
+        "--cadence-observation-lookahead-s",
+        type=float,
+        default=0.40,
+        help=(
+            "Post-R lookahead used for the 7 unstimulated cadence observation beats. "
+            "It is capped before the next detected peak. The 8th beat is still "
+            "trigger-only and is not analyzed by Layer 2."
+        ),
+    )
+    p.add_argument(
+        "--cadence-min-safe-observations",
+        type=int,
+        default=6,
+        help="Minimum safe Layer 2 decisions required among the 7 observation beats.",
+    )
+    p.add_argument(
+        "--cadence-allow-unsafe-last-observation",
+        action="store_true",
+        help="Allow stimulation even if the 7th observation beat was unsafe.",
+    )
     p.add_argument("--species", default="human")
     p.add_argument(
         "--abnormal-target", type=float, default=0.95,
@@ -1161,6 +1326,9 @@ def main(argv=None) -> None:
         feature_window_mode=args.feature_window_mode,
         post_r_lookahead_s=args.post_r_lookahead_s,
         max_records_per_dataset=args.max_records_per_dataset,
+        cadence_observation_lookahead_s=args.cadence_observation_lookahead_s,
+        cadence_min_safe_observations=args.cadence_min_safe_observations,
+        cadence_require_last_observation_safe=not args.cadence_allow_unsafe_last_observation,
     )
 
 

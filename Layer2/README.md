@@ -44,6 +44,8 @@ Layer2/
 
 | `pipeline/main_pipeline.py` | Public API: extract, calibrate, decide |
 
+| `pipeline/stimulation_cadence.py` | Prospective 1-in-8 stimulation policy |
+
 | `pipeline/full_features.py` | Feature assembler |
 
 | `pipeline/decision/` | Baseline calibration + permit/inhibit logic |
@@ -71,6 +73,10 @@ Layer2/
 | Pareto / operating point | `validation/run_pareto_sweep.py {quick,full,posthoc}` |
 
 | Causal lookahead sweep | `validation/run_causal_lookahead_sweep.py` |
+
+The deployment-like scripts also report a prospective cadence mode: observe 7
+unstimulated beats with a longer causal lookahead, then stimulate only the 8th
+beat if at least 6 of those decisions were safe and the 7th beat was safe.
 
 
 

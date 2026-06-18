@@ -14,6 +14,17 @@ ECG window + R-peak history
   -> decide_layer2()         # at each trigger / rolling window
 ```
 
+For the current stimulation strategy, Layer 2 is used prospectively:
+
+```text
+beats 1-7: score safety on unstimulated beats
+beat 8:    stimulate only if the observation block is safe enough
+```
+
+This means the 8th beat is not analyzed before stimulation. The decision has
+already been made; at the 8th R-peak the runtime only needs to detect the R peak
+and apply the stored trigger/no-trigger flag.
+
 Main entry point: `pipeline/main_pipeline.py`
 
 ```python
@@ -33,9 +44,10 @@ assemble:
 
 | Buffer | Size | Used for |
 |--------|------|----------|
-| ECG morphology window | past 5 s + 100 ms after trigger R | `signal__*`, `morph__*` |
+| ECG morphology window | past 5 s + post-R lookahead | `signal__*`, `morph__*` |
 | RR rhythm buffer | past 30 s of accepted peaks | `rr__` scalar stats |
 | Spectral HRV buffer | past 60 s of accepted peaks | `rr__hrv_*` (optional) |
+| Cadence safety state | last 7 unstimulated Layer 2 decisions | 1-in-8 prospective trigger |
 
 Why separate horizons?
 
@@ -390,6 +402,42 @@ calibration data and duplicate covariance structures).
 
 ---
 
+### Prospective 1-in-8 stimulation cadence
+
+Implementation: `pipeline/stimulation_cadence.py`
+
+The current deployment assumption is that the actuator is stimulated at most
+once every 8 accepted R-peaks. Layer 2 therefore does not try to classify the
+candidate beat after its R-peak. Instead:
+
+```text
+1. accepted beats 1-7 are unstimulated observation beats
+2. each observation beat updates Layer 2 safety state
+3. accepted beat 8 is the only stimulation candidate
+4. default policy permits if at least 6 of 7 were safe and beat 7 was safe
+5. after beat 8, the cadence state resets and a new 7-beat observation block starts
+```
+
+Why this matters:
+
+- mechanical contraction follows the electrical R-peak too quickly to wait for
+  full morphology/feature analysis on the same beat
+- the safety decision must therefore be ready before the stimulation candidate
+- the candidate beat still needs a valid fast R-peak trigger, but it is not used
+  for the full Layer 2 decision
+- observation beats can use a longer causal post-R lookahead (default 400 ms,
+  capped before the next detected peak), because the decision is only needed
+  before the 8th beat
+
+Validation modes using this idea:
+
+```text
+run_beat_validation.py          -> rpeak_adaptive_cadence_1of8
+run_cross_dataset_validation.py -> fast_causal_cadence_1of8
+```
+
+---
+
 ## Step 4: Fixed Policy (`decision/config.py`)
 
 Not learned from data. Set by safety policy and benchmark tuning.
@@ -436,7 +484,7 @@ Layer 2 has two support areas beyond `pipeline/`:
 
 | Script | Purpose | When to use |
 |--------|---------|-------------|
-| `run_beat_validation.py` | one decision per R-peak, causal/centered modes | Deployment-like benchmark |
+| `run_beat_validation.py` | beat-sync and 1-in-8 cadence modes | Deployment-like benchmark |
 | `run_cross_dataset_validation.py` | MIT-BIH, NSTDB, SVDB, INCART, CUDB, VFDB | Generalization study |
 | `run_pareto_sweep.py` | unified Pareto entry point: quick / full / posthoc | Operating-point search |
 | `run_causal_lookahead_sweep.py` | sweep post-R lookahead ms | Causal delay budget study |

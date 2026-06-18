@@ -2,8 +2,10 @@
 Layer 2 beat-synchronous validation.
 
 Scores one permit/inhibit decision per R-peak trigger (not per 5 s clock window).
+Cadence modes are also reported: they observe 7 unstimulated beats and then
+score only the 8th beat as a stimulation opportunity.
 
-For each normal annotated beat (or each Layer1 accepted peak):
+For each normal annotated beat or RPeakDetection trigger:
   - morphology features from a deployment-causal ECG slice (default: causal mode)
   - RR features from peaks in [t_beat - rr_lookback_s, t_beat]
   - Layer 2 gate decision for THAT trigger
@@ -31,7 +33,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import logging
 import sys
 import time
@@ -45,24 +46,15 @@ _HERE = Path(__file__).resolve().parent
 _L2 = _HERE.parent
 _ROOT = _L2.parent
 _DATA = _ROOT / "data"
+sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_L2))
 sys.path.insert(0, str(_DATA))
 from _bootstrap import setup_layer2_paths  # noqa: E402
 
 setup_layer2_paths()
-_L1 = _ROOT / "Layer1"
-_l1_bootstrap = importlib.util.spec_from_file_location(
-    "layer1_bootstrap", _L1 / "_bootstrap.py",
-)
-if _l1_bootstrap is None or _l1_bootstrap.loader is None:
-    raise ImportError("Cannot load Layer1 bootstrap")
-layer1_bootstrap = importlib.util.module_from_spec(_l1_bootstrap)
-_l1_bootstrap.loader.exec_module(layer1_bootstrap)
-sys.path.insert(0, str(_L1))
-setup_layer1_paths = layer1_bootstrap.setup_layer1_paths
-setup_layer1_paths(include_archive=True)
 
 from full_features import full_features  # noqa: E402
+from stimulation_cadence import ProspectiveCadenceGate  # noqa: E402
 
 # Reuse shared validation utilities
 from dataset_registry import DATASET_GROUPS, dataset_dir, resolve_dataset  # noqa: E402
@@ -71,7 +63,7 @@ from common import (  # noqa: E402
     CALIBRATION_RECORDS,
     NORMAL_BEATS,
     apply_filters,
-    layer1_r_peaks,
+    rpeak_detector_peaks,
     score_one,
     score_one_hybrid,
     _fit_calibrator,
@@ -401,6 +393,9 @@ def run_beat_sync_validation(
     all_use_hybrid_gate: bool = False,
     feature_window_mode: str = "causal",
     post_r_lookahead_s: float = 0.08,
+    cadence_observation_lookahead_s: float = 0.40,
+    cadence_min_safe_observations: int = 6,
+    cadence_require_last_observation_safe: bool = True,
 ) -> None:
     import wfdb
 
@@ -450,11 +445,8 @@ def run_beat_sync_validation(
                 else apply_filters(raw, fs)
             )
 
-            l1_peaks = layer1_r_peaks(filt, fs)
-            ad_peaks = (
-                adaptive_layer1_r_peaks(filt, fs, deployment_adaptive_config())
-                if include_adaptive and _ADAPTIVE_OK else np.array([])
-            )
+            l1_peaks = rpeak_detector_peaks(raw, fs)
+            ad_peaks = np.array([], dtype=float)
 
             # Per-record calibrators from first healthy annotated beats (oracle peaks)
             oracle_peaks = np.array([
@@ -530,6 +522,29 @@ def run_beat_sync_validation(
                             )
                         record_cals[fset] = cal
 
+            def _score_feature_set(
+                fset: str,
+                feats: Dict[str, float],
+                n_beats_win: int,
+            ) -> Optional[Dict[str, object]]:
+                cal = record_cals.get(fset)
+                if cal is None:
+                    return None
+                aligned = align_features_for_scoring(feats, cal)
+                if fset == "hybrid_rewarming":
+                    return score_one_hybrid(
+                        aligned, cal,
+                        n_beats_in_window=max(1, n_beats_win),
+                        n_recent_clean_beats=10,
+                    )
+                if fset == "all" and all_use_hybrid_gate:
+                    return score_one_hybrid(
+                        aligned, cal,
+                        n_beats_in_window=max(1, n_beats_win),
+                        n_recent_clean_beats=10,
+                    )
+                return score_one(aligned, cal)
+
             def _score_trigger(
                 beat_time_s: float,
                 sym: str,
@@ -554,24 +569,9 @@ def run_beat_sync_validation(
                     "n_beats_morph_window": n_beats_win,
                 }
                 for fset in feature_sets:
-                    cal = record_cals.get(fset)
-                    if cal is None:
+                    sc = _score_feature_set(fset, feats, n_beats_win)
+                    if sc is None:
                         continue
-                    aligned = align_features_for_scoring(feats, cal)
-                    if fset == "hybrid_rewarming":
-                        sc = score_one_hybrid(
-                            aligned, cal,
-                            n_beats_in_window=max(1, n_beats_win),
-                            n_recent_clean_beats=10,
-                        )
-                    elif fset == "all" and all_use_hybrid_gate:
-                        sc = score_one_hybrid(
-                            aligned, cal,
-                            n_beats_in_window=max(1, n_beats_win),
-                            n_recent_clean_beats=10,
-                        )
-                    else:
-                        sc = score_one(aligned, cal)
                     r = {**base, "feature_set": fset, "mode": mode, **sc}
                     r["inhibit_class"] = _classify_inhibit(str(r.get("reason", "")))
                     rows.append(r)
@@ -588,14 +588,14 @@ def run_beat_sync_validation(
                 if window_limit and n_scored >= window_limit:
                     break
                 _score_trigger(t_beat, sym, lbl, oracle_peaks, "oracle")
-                # Layer2 at each true heartbeat using Layer1 RR stream (fair RR test)
+                # Layer2 at each true heartbeat using the RPeakDetection RR stream.
                 if len(l1_peaks):
-                    _score_trigger(t_beat, sym, lbl, l1_peaks, "layer1_rr_at_beat")
+                    _score_trigger(t_beat, sym, lbl, l1_peaks, "rpeak_adaptive_rr_at_beat")
                 if len(ad_peaks):
-                    _score_trigger(t_beat, sym, lbl, ad_peaks, "layer1_adaptive_rr_at_beat")
+                    _score_trigger(t_beat, sym, lbl, ad_peaks, "rpeak_adaptive_extra_rr_at_beat")
                 n_scored += 1
 
-            # Layer1 modes: one decision per accepted trigger
+            # RPeakDetection modes: one decision per detector trigger.
             def _label_at(t_s: float) -> Tuple[str, str]:
                 best_sym, best_d = "?", "mixed"
                 best_dt = tol_s + 1
@@ -609,7 +609,7 @@ def run_beat_sync_validation(
                     return best_sym, "mixed"
                 return best_sym, best_d
 
-            for peaks, mode in ((l1_peaks, "layer1"),):
+            for peaks, mode in ((l1_peaks, "rpeak_adaptive"),):
                 if len(peaks) == 0:
                     continue
                 for t_beat in peaks:
@@ -619,7 +619,88 @@ def run_beat_sync_validation(
             if len(ad_peaks):
                 for t_beat in ad_peaks:
                     sym, lbl = _label_at(float(t_beat))
-                    _score_trigger(float(t_beat), sym, lbl, ad_peaks, "layer1_adaptive_gated")
+                    _score_trigger(float(t_beat), sym, lbl, ad_peaks, "rpeak_adaptive_extra_gated")
+
+            def _score_cadence(peaks: np.ndarray, mode: str) -> None:
+                if len(peaks) == 0:
+                    return
+                gates = {
+                    fset: ProspectiveCadenceGate(
+                        cycle_length=8,
+                        observation_beats=7,
+                        min_safe_observations=cadence_min_safe_observations,
+                        require_last_observation_safe=cadence_require_last_observation_safe,
+                    )
+                    for fset in feature_sets
+                }
+                cadence_policy = (
+                    f"min{cadence_min_safe_observations}of7"
+                    f"_lastsafe{int(cadence_require_last_observation_safe)}"
+                )
+                n_candidates = 0
+                for peak_idx, t_beat in enumerate(peaks):
+                    if window_limit and n_candidates >= window_limit:
+                        break
+                    t_float = float(t_beat)
+                    sym, lbl = _label_at(t_float)
+
+                    if per_record_calibration and lbl == "healthy" and t_float <= cal_end_t:
+                        for gate in gates.values():
+                            gate.reset()
+                        continue
+
+                    any_gate = next(iter(gates.values()))
+                    is_candidate = any_gate.next_phase == any_gate.cycle_length
+
+                    if is_candidate:
+                        base = {
+                            "dataset": dataset,
+                            "group": group,
+                            "record": hea.stem,
+                            "beat_time_s": round(t_float, 3),
+                            "beat_symbol": sym,
+                            "label": lbl,
+                            "n_beats_morph_window": np.nan,
+                            "cadence_policy": cadence_policy,
+                            "cadence_observation_lookahead_s": cadence_observation_lookahead_s,
+                        }
+                        for fset, gate in gates.items():
+                            cadence = gate.step(
+                                safety_decision=None,
+                                trigger_ok=True,
+                                trigger_reason="r_peak_detected",
+                            )
+                            if record_cals.get(fset) is None:
+                                continue
+                            r = {**base, "feature_set": fset, "mode": mode, **cadence}
+                            r["inhibit_class"] = _classify_inhibit(str(r.get("reason", "")))
+                            rows.append(r)
+                        n_candidates += 1
+                        continue
+
+                    future_peaks = peaks[peaks > (t_float + 0.003)]
+                    if len(future_peaks):
+                        max_causal_lookahead_s = max(
+                            0.0, float(future_peaks[0] - t_float - 0.003)
+                        )
+                    else:
+                        max_causal_lookahead_s = float(cadence_observation_lookahead_s)
+                    obs_lookahead_s = min(
+                        float(cadence_observation_lookahead_s),
+                        max_causal_lookahead_s,
+                    )
+                    feats, n_beats_win = extract_beat_features(
+                        filt, fs, t_float, peaks,
+                        morphology_window_s, rr_lookback_s, species,
+                        feature_window_mode, obs_lookahead_s,
+                    )
+                    for fset, gate in gates.items():
+                        sc = _score_feature_set(fset, feats, n_beats_win)
+                        gate.step(sc)
+
+            _score_cadence(l1_peaks, "rpeak_adaptive_cadence_1of8")
+            if len(ad_peaks):
+                _score_cadence(ad_peaks, "rpeak_adaptive_extra_cadence_1of8")
 
             log.info(f"  {hea.stem}: {n_scored} oracle beats  {time.time()-t0:.1f}s")
 
@@ -733,6 +814,26 @@ def main(argv=None) -> None:
         help="Post-R lookahead in seconds used in causal mode (default 0.08 = 80 ms). "
              "Must be <= stimulation delay to remain causal for the trigger beat.",
     )
+    p.add_argument(
+        "--cadence-observation-lookahead-s",
+        type=float,
+        default=0.40,
+        help=(
+            "Post-R lookahead for 1-in-8 cadence observation beats. "
+            "It is capped before the next detected peak; the 8th beat remains trigger-only."
+        ),
+    )
+    p.add_argument(
+        "--cadence-min-safe-observations",
+        type=int,
+        default=6,
+        help="Minimum safe Layer 2 decisions required among the 7 observation beats.",
+    )
+    p.add_argument(
+        "--cadence-allow-unsafe-last-observation",
+        action="store_true",
+        help="Allow stimulation even if the 7th observation beat was unsafe.",
+    )
     args = p.parse_args(argv)
 
     run_beat_sync_validation(
@@ -752,6 +853,9 @@ def main(argv=None) -> None:
         all_use_hybrid_gate=args.all_use_hybrid_gate,
         feature_window_mode=args.feature_window_mode,
         post_r_lookahead_s=args.post_r_lookahead_s,
+        cadence_observation_lookahead_s=args.cadence_observation_lookahead_s,
+        cadence_min_safe_observations=args.cadence_min_safe_observations,
+        cadence_require_last_observation_safe=not args.cadence_allow_unsafe_last_observation,
     )
 
 
