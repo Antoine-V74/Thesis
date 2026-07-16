@@ -46,6 +46,14 @@ class GateMixin:
         mahal_idx = [self.feature_names.index(f) for f in self.mahal_feature_names]
         x_m = x_all[mahal_idx]
         mahal_val = self._mahalanobis_batch_m(x_m[None, :])[0]
+        center_m = self.mean[mahal_idx]
+        scale_m = self.std[mahal_idx]
+        z_m = (x_m - center_m) / scale_m
+        if getattr(self, "anomaly_model", "mahalanobis") == "knn":
+            knn_val = float(self._knn_distance_batch(z_m[None, :])[0])
+        else:
+            knn_val = float("nan")
+        primary_val = knn_val if getattr(self, "anomaly_model", "mahalanobis") == "knn" else float(mahal_val)
 
         sig_idx = [i for i, n in enumerate(self.feature_names) if n.startswith("signal__")]
         rr_idx = [i for i, n in enumerate(self.feature_names) if n.startswith("rr__")]
@@ -55,6 +63,8 @@ class GateMixin:
 
         out: Dict[str, float] = {
             "mahalanobis": float(mahal_val),
+            "knn": knn_val,
+            "primary_distance": primary_val,
             "signal_mahal_proxy": sig_proxy,
             "rr_mahal_proxy": rr_proxy,
             "max_abs_zscore": float(np.max(np.abs(z_all[z_idx]))),
@@ -102,9 +112,13 @@ class GateMixin:
             }
 
         s = self.score(features)
-        inhibit_m = s["mahalanobis"] > self.threshold_mahalanobis
+        inhibit_primary = s["primary_distance"] > self.threshold_mahalanobis
         inhibit_z = s["max_abs_zscore"] > self.threshold_max_zscore
-        inhibit = bool(inhibit_m or inhibit_z)
+        inhibit = bool(inhibit_primary or inhibit_z)
+        primary_reason = (
+            "knn_exceeded" if getattr(self, "anomaly_model", "mahalanobis") == "knn"
+            else "mahalanobis_exceeded"
+        )
 
         z_items = [(n, s[f"zscore_{n}"]) for n in self._decision_feature_names()]
         z_items.sort(key=lambda kv: abs(kv[1]), reverse=True)
@@ -114,12 +128,14 @@ class GateMixin:
             "permit": not inhibit,
             "inhibit": inhibit,
             "reason": (
-                "mahalanobis_exceeded" if inhibit_m
+                primary_reason if inhibit_primary
                 else "max_zscore_exceeded" if inhibit_z
                 else "within_baseline"
             ),
             "hard_rule_violated": None,
             "mahalanobis": s["mahalanobis"],
+            "knn": s.get("knn", float("nan")),
+            "primary_distance": s.get("primary_distance", s["mahalanobis"]),
             "mahalanobis_threshold": self.threshold_mahalanobis,
             "signal_mahal_proxy": s["signal_mahal_proxy"],
             "rr_mahal_proxy": s["rr_mahal_proxy"],
@@ -179,10 +195,12 @@ class GateMixin:
             }
 
         if rr_history_reliable:
-            rr_safe = s["mahalanobis"] <= self.threshold_mahalanobis
+            primary = s.get("primary_distance", s["mahalanobis"])
+            rr_safe = primary <= self.threshold_mahalanobis
             if rr_safe:
                 return {"permit": True, "inhibit": False, "reason": "all_safe", **base}
-            return {"permit": False, "inhibit": True, "reason": "rr_abnormal", **base}
+            reason = "knn_exceeded" if getattr(self, "anomaly_model", "mahalanobis") == "knn" else "rr_abnormal"
+            return {"permit": False, "inhibit": True, "reason": reason, **base}
 
         if n_recent_clean_beats >= warm_beats:
             return {

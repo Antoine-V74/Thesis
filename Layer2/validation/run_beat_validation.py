@@ -49,6 +49,9 @@ _DATA = _ROOT / "data"
 sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_L2))
 sys.path.insert(0, str(_DATA))
+_L3_PIPELINE = _ROOT / "Layer3" / "pipeline"
+if str(_L3_PIPELINE) not in sys.path:
+    sys.path.insert(0, str(_L3_PIPELINE))
 from _bootstrap import setup_layer2_paths  # noqa: E402
 
 setup_layer2_paths()
@@ -70,6 +73,16 @@ from common import (  # noqa: E402
     _select_finite_features,
     align_features_for_scoring,
 )
+from layer2_validation_utils import (  # noqa: E402
+    annotate_rhythm_spans,
+    beat_split_label,
+    compute_guard_end_time,
+    infer_risk_family,
+    policy_metrics_by_group,
+    safety_group_for_beat,
+    write_threshold_coverage,
+)
+from label_grouping import NORMAL  # noqa: E402
 
 _ADAPTIVE_OK = False
 
@@ -396,6 +409,14 @@ def run_beat_sync_validation(
     cadence_observation_lookahead_s: float = 0.40,
     cadence_min_safe_observations: int = 6,
     cadence_require_last_observation_safe: bool = True,
+    threshold_method: str = "conformal",
+    conformal_alpha: float = 0.10,
+    calibration_outlier_frac: float = 0.0,
+    anomaly_model: str = "mahalanobis",
+    knn_k: int = 5,
+    guard_s: float = 5.0,
+    use_policy_grouping: bool = True,
+    af_treated_as: str = "inhibit",
 ) -> None:
     import wfdb
 
@@ -445,6 +466,13 @@ def run_beat_sync_validation(
                 else apply_filters(raw, fs)
             )
 
+            ann_aux = getattr(ann, "aux_note", None)
+            if ann_aux is None:
+                ann_aux = [""] * len(ann.symbol)
+            rhythm_spans = annotate_rhythm_spans(
+                ann.sample, ann.symbol, ann_aux, int(rec.sig_len)
+            )
+
             l1_peaks = rpeak_detector_peaks(raw, fs)
             ad_peaks = np.array([], dtype=float)
 
@@ -456,11 +484,18 @@ def run_beat_sync_validation(
 
             record_cals: Dict[str, Optional[object]] = {f: None for f in feature_sets}
             cal_end_t = 0.0
+            guard_end_t = 0.0
             if per_record_calibration:
-                healthy_times = sorted(
-                    s / fs for s, sym in zip(ann.sample, ann.symbol)
-                    if beat_label(sym, dataset) == "healthy"
-                )
+                if use_policy_grouping:
+                    healthy_times = sorted(
+                        s / fs for s, sym in zip(ann.sample, ann.symbol)
+                        if safety_group_for_beat(int(s), sym, rhythm_spans, dataset) == NORMAL
+                    )
+                else:
+                    healthy_times = sorted(
+                        s / fs for s, sym in zip(ann.sample, ann.symbol)
+                        if beat_label(sym, dataset) == "healthy"
+                    )
                 n_cal = max(5, int(len(healthy_times) * cal_frac))
                 cal_feats: List[Dict] = []
                 for t_beat in healthy_times[:n_cal]:
@@ -474,6 +509,7 @@ def run_beat_sync_validation(
                 if len(cal_feats) >= 5:
                     fn, cal_feats = _select_finite_features(cal_feats)
                     cal_end_t = healthy_times[min(n_cal, len(healthy_times)) - 1]
+                    guard_end_t = compute_guard_end_time(cal_end_t, guard_s)
                     abn_cal_feats: List[Dict] = []
                     h_val_feats: List[Dict] = []
                     if abnormal_target_inhibit is not None:
@@ -499,7 +535,16 @@ def run_beat_sync_validation(
 
                     for fset in feature_sets:
                         cal = _fit_calibrator(
-                            cal_feats, fn, threshold_quantile, fset)
+                            cal_feats,
+                            fn,
+                            threshold_quantile,
+                            fset,
+                            threshold_method=threshold_method,
+                            conformal_alpha=conformal_alpha,
+                            calibration_outlier_frac=calibration_outlier_frac,
+                            anomaly_model=anomaly_model,
+                            knn_k=knn_k,
+                        )
                         if (
                             abnormal_target_inhibit is not None
                             and fset in ("all", "hybrid_rewarming")
@@ -545,20 +590,38 @@ def run_beat_sync_validation(
                     )
                 return score_one(aligned, cal)
 
+            def _append_row(base: Dict, fset: str, mode: str, sc: Optional[Dict[str, object]]) -> None:
+                if sc is None:
+                    return
+                r = {**base, "feature_set": fset, "mode": mode, **sc}
+                r["decision"] = "permit" if r.get("permit") else "inhibit"
+                r["inhibit_class"] = _classify_inhibit(str(r.get("reason", "")))
+                r["risk_family"] = infer_risk_family(
+                    str(r.get("reason", "")),
+                    str(r.get("hard_rule_violated") or ""),
+                    float(r.get("signal_mahal_proxy", float("nan"))),
+                    float(r.get("rr_mahal_proxy", float("nan"))),
+                    float(getattr(record_cals.get(fset), "threshold_signal_proxy", float("nan"))),
+                    float(getattr(record_cals.get(fset), "threshold_rr_proxy", float("nan"))),
+                )
+                rows.append(r)
+
             def _score_trigger(
                 beat_time_s: float,
                 sym: str,
                 lbl: str,
                 peaks: np.ndarray,
                 mode: str,
+                beat_sample: Optional[int] = None,
             ) -> None:
-                if per_record_calibration and lbl == "healthy" and beat_time_s <= cal_end_t:
-                    return
-                feats, n_beats_win = extract_beat_features(
-                    filt, fs, beat_time_s, peaks,
-                    morphology_window_s, rr_lookback_s, species,
-                    feature_window_mode, post_r_lookahead_s,
+                sample = int(beat_sample if beat_sample is not None else round(beat_time_s * fs))
+                safety_group = (
+                    safety_group_for_beat(sample, sym, rhythm_spans, dataset)
+                    if use_policy_grouping else lbl
                 )
+                is_healthy = bool(safety_group == NORMAL) if use_policy_grouping else (lbl == "healthy")
+                split = beat_split_label(beat_time_s, cal_end_t, guard_end_t) if per_record_calibration else "test"
+
                 base = {
                     "dataset": dataset,
                     "group": group,
@@ -566,15 +629,64 @@ def run_beat_sync_validation(
                     "beat_time_s": round(beat_time_s, 3),
                     "beat_symbol": sym,
                     "label": lbl,
-                    "n_beats_morph_window": n_beats_win,
+                    "safety_group": safety_group,
+                    "is_healthy": is_healthy,
+                    "split": split,
+                    "n_beats_morph_window": np.nan,
+                    "threshold_method": threshold_method,
+                    "anomaly_model": anomaly_model,
+                    "conformal_alpha": conformal_alpha,
                 }
+
+                if split == "calibration":
+                    for fset in feature_sets:
+                        _append_row(base, fset, mode, {
+                            "permit": False,
+                            "reason": "calibration_no_stim",
+                            "mahalanobis": float("nan"),
+                            "knn": float("nan"),
+                            "primary_distance": float("nan"),
+                            "mahalanobis_threshold": float("nan"),
+                            "signal_mahal_proxy": float("nan"),
+                            "rr_mahal_proxy": float("nan"),
+                            "max_zscore": float("nan"),
+                            "zscore_threshold": float("nan"),
+                            "hard_rule_violated": "",
+                            "top1_feature": "", "top1_zscore": float("nan"),
+                            "top2_feature": "", "top2_zscore": float("nan"),
+                            "top3_feature": "", "top3_zscore": float("nan"),
+                        })
+                    return
+
+                if split == "guard":
+                    for fset in feature_sets:
+                        _append_row(base, fset, mode, {
+                            "permit": False,
+                            "reason": "guard_excluded",
+                            "mahalanobis": float("nan"),
+                            "knn": float("nan"),
+                            "primary_distance": float("nan"),
+                            "mahalanobis_threshold": float("nan"),
+                            "signal_mahal_proxy": float("nan"),
+                            "rr_mahal_proxy": float("nan"),
+                            "max_zscore": float("nan"),
+                            "zscore_threshold": float("nan"),
+                            "hard_rule_violated": "",
+                            "top1_feature": "", "top1_zscore": float("nan"),
+                            "top2_feature": "", "top2_zscore": float("nan"),
+                            "top3_feature": "", "top3_zscore": float("nan"),
+                        })
+                    return
+
+                feats, n_beats_win = extract_beat_features(
+                    filt, fs, beat_time_s, peaks,
+                    morphology_window_s, rr_lookback_s, species,
+                    feature_window_mode, post_r_lookahead_s,
+                )
+                base["n_beats_morph_window"] = n_beats_win
                 for fset in feature_sets:
                     sc = _score_feature_set(fset, feats, n_beats_win)
-                    if sc is None:
-                        continue
-                    r = {**base, "feature_set": fset, "mode": mode, **sc}
-                    r["inhibit_class"] = _classify_inhibit(str(r.get("reason", "")))
-                    rows.append(r)
+                    _append_row(base, fset, mode, sc)
 
             tol_s = 0.080
             n_scored = 0
@@ -587,12 +699,12 @@ def run_beat_sync_validation(
                 t_beat = s / fs
                 if window_limit and n_scored >= window_limit:
                     break
-                _score_trigger(t_beat, sym, lbl, oracle_peaks, "oracle")
+                _score_trigger(t_beat, sym, lbl, oracle_peaks, "oracle", beat_sample=int(s))
                 # Layer2 at each true heartbeat using the RPeakDetection RR stream.
                 if len(l1_peaks):
-                    _score_trigger(t_beat, sym, lbl, l1_peaks, "rpeak_adaptive_rr_at_beat")
+                    _score_trigger(t_beat, sym, lbl, l1_peaks, "rpeak_adaptive_rr_at_beat", beat_sample=int(s))
                 if len(ad_peaks):
-                    _score_trigger(t_beat, sym, lbl, ad_peaks, "rpeak_adaptive_extra_rr_at_beat")
+                    _score_trigger(t_beat, sym, lbl, ad_peaks, "rpeak_adaptive_extra_rr_at_beat", beat_sample=int(s))
                 n_scored += 1
 
             # RPeakDetection modes: one decision per detector trigger.
@@ -649,6 +761,14 @@ def run_beat_sync_validation(
                             gate.reset()
                         continue
 
+                    split = beat_split_label(t_float, cal_end_t, guard_end_t) if per_record_calibration else "test"
+                    sample = int(round(t_float * fs))
+                    safety_group = (
+                        safety_group_for_beat(sample, sym, rhythm_spans, dataset)
+                        if use_policy_grouping else lbl
+                    )
+                    is_healthy = bool(safety_group == NORMAL) if use_policy_grouping else (lbl == "healthy")
+
                     any_gate = next(iter(gates.values()))
                     is_candidate = any_gate.next_phase == any_gate.cycle_length
 
@@ -660,9 +780,15 @@ def run_beat_sync_validation(
                             "beat_time_s": round(t_float, 3),
                             "beat_symbol": sym,
                             "label": lbl,
+                            "safety_group": safety_group,
+                            "is_healthy": is_healthy,
+                            "split": split,
                             "n_beats_morph_window": np.nan,
                             "cadence_policy": cadence_policy,
                             "cadence_observation_lookahead_s": cadence_observation_lookahead_s,
+                            "threshold_method": threshold_method,
+                            "anomaly_model": anomaly_model,
+                            "conformal_alpha": conformal_alpha,
                         }
                         for fset, gate in gates.items():
                             cadence = gate.step(
@@ -673,6 +799,7 @@ def run_beat_sync_validation(
                             if record_cals.get(fset) is None:
                                 continue
                             r = {**base, "feature_set": fset, "mode": mode, **cadence}
+                            r["decision"] = "permit" if r.get("permit") else "inhibit"
                             r["inhibit_class"] = _classify_inhibit(str(r.get("reason", "")))
                             rows.append(r)
                         n_candidates += 1
@@ -711,44 +838,89 @@ def run_beat_sync_validation(
 
     df.to_csv(out_dir / "per_beat.csv", index=False)
 
-    metrics = build_metrics(df)
+    test_df = df[df.get("split", "test") == "test"].copy()
+    if "decision" not in test_df.columns:
+        test_df["decision"] = np.where(test_df["permit"].astype(bool), "permit", "inhibit")
+
+    metrics = build_metrics(test_df)
     metrics.to_csv(out_dir / "metrics_by_label.csv", index=False)
 
-    per_rec = _per_record_metrics(df)
+    per_rec = _per_record_metrics(test_df)
     per_rec.to_csv(out_dir / "per_record.csv", index=False)
 
-    per_grp = _per_group_metrics(df)
+    per_grp = _per_group_metrics(test_df)
     per_grp.to_csv(out_dir / "per_group.csv", index=False)
 
-    # Overall metrics (aggregated across all records)
+    policy_df = policy_metrics_by_group(test_df, af_treated_as=af_treated_as)
+    policy_df.to_csv(out_dir / "metrics_by_safety_group.csv", index=False)
+
+    target_fi = (
+        float(conformal_alpha)
+        if threshold_method == "conformal"
+        else float(1.0 - threshold_quantile)
+    )
+    for (fset, mode), grp in test_df.groupby(["feature_set", "mode"]):
+        subdir = out_dir / "coverage" / f"{fset}_{mode}"
+        subdir.mkdir(parents=True, exist_ok=True)
+        write_threshold_coverage(
+            grp,
+            subdir,
+            threshold_method=threshold_method,
+            target_false_inhibit=target_fi,
+            healthy_col="is_healthy",
+            record_col="record",
+        )
+    # Combined coverage table at run root (primary feature_set/mode if present).
+    primary = test_df[
+        (test_df["feature_set"] == feature_sets[0]) & (test_df["mode"] == "oracle")
+    ] if len(test_df) else test_df
+    if len(primary):
+        write_threshold_coverage(
+            primary,
+            out_dir,
+            threshold_method=threshold_method,
+            target_false_inhibit=target_fi,
+            healthy_col="is_healthy",
+            record_col="record",
+        )
+
+    # Overall metrics (aggregated across all records, test split only)
     overall_rows = []
-    for (fset, mode), grp in df.groupby(["feature_set", "mode"]):
-        h = grp[grp["label"] == "healthy"]
+    for (fset, mode), grp in test_df.groupby(["feature_set", "mode"]):
+        h = grp[grp["is_healthy"].astype(bool)] if "is_healthy" in grp.columns else grp[grp["label"] == "healthy"]
         ab = grp[grp["label"].isin(["abnormal_v", "abnormal_noise"])]
+        dangerous = grp[grp.get("safety_group", "") == "DANGEROUS"] if "safety_group" in grp.columns else ab
         overall_rows.append({
             "feature_set": fset,
             "mode": mode,
             "n_healthy": len(h),
             "n_abnormal": len(ab),
+            "n_dangerous": len(dangerous),
             "healthy_permit_rate": round(h["permit"].mean(), 4) if len(h) else float("nan"),
             "false_inhibit_rate": round((~h["permit"]).mean(), 4) if len(h) else float("nan"),
             "abnormal_inhibit_rate": round((~ab["permit"]).mean(), 4) if len(ab) else float("nan"),
             "false_permit_rate": round(ab["permit"].mean(), 4) if len(ab) else float("nan"),
+            "dangerous_false_permit_rate": round(dangerous["permit"].mean(), 4) if len(dangerous) else float("nan"),
         })
     metrics_overall = pd.DataFrame(overall_rows)
     metrics_overall.to_csv(out_dir / "metrics_overall.csv", index=False)
 
-    consec = _consec_inhibit_dist(df[df["label"] == "healthy"] if len(df) else df)
+    consec = _consec_inhibit_dist(test_df[test_df["label"] == "healthy"] if len(test_df) else test_df)
     consec.to_csv(out_dir / "consec_inhibit_dist.csv", index=False)
 
-    inh_reasons = _inhibit_reasons(df)
+    inh_reasons = _inhibit_reasons(test_df)
     inh_reasons.to_csv(out_dir / "inhibit_reasons.csv", index=False)
     if len(inh_reasons):
         inh_reasons.groupby(["feature_set", "mode", "inhibit_class"], as_index=False)[
             "n_inhibited"
         ].sum().to_csv(out_dir / "inhibit_class_breakdown.csv", index=False)
 
-    top_feats = _top_inhibit_features(df)
+    if "risk_family" in test_df.columns:
+        test_df.groupby(["feature_set", "mode", "risk_family"], as_index=False).size().to_csv(
+            out_dir / "risk_family_breakdown.csv", index=False
+        )
+
+    top_feats = _top_inhibit_features(test_df)
     top_feats.to_csv(out_dir / "top_inhibit_features.csv", index=False)
 
     # Side-by-side pivot for healthy beats
@@ -784,6 +956,25 @@ def main(argv=None) -> None:
     p.add_argument("--no-per-record-calibration", action="store_true")
     p.add_argument("--cal-frac", type=float, default=0.6)
     p.add_argument("--threshold-quantile", type=float, default=0.999)
+    p.add_argument(
+        "--threshold-method",
+        default="conformal",
+        choices=["conformal", "healthy_quantile"],
+        help="Healthy validation threshold. conformal (default) uses --conformal-alpha budget.",
+    )
+    p.add_argument("--conformal-alpha", type=float, default=0.10,
+                   help="Target healthy false-inhibit rate for conformal thresholding.")
+    p.add_argument("--calibration-outlier-frac", type=float, default=0.0,
+                   help="Optional fraction of farthest healthy calibration beats to prune before refit.")
+    p.add_argument("--anomaly-model", default="mahalanobis", choices=["mahalanobis", "knn"],
+                   help="Primary baseline distance scorer.")
+    p.add_argument("--knn-k", type=int, default=5, help="k for --anomaly-model knn.")
+    p.add_argument("--guard-s", type=float, default=5.0,
+                   help="Seconds after calibration end excluded from test metrics (overlap guard).")
+    p.add_argument("--no-policy-grouping", action="store_true",
+                   help="Use legacy healthy/abnormal labels instead of Layer3 safety_group policy.")
+    p.add_argument("--af-treated-as", default="inhibit", choices=["inhibit", "permit", "exclude"],
+                   help="Policy for AF_CONTEXT safety_group in policy metrics.")
     p.add_argument("--include-adaptive", action="store_true", default=True)
     p.add_argument("--window-limit", type=int, default=None)
     p.add_argument(
@@ -846,6 +1037,14 @@ def main(argv=None) -> None:
         per_record_calibration=not args.no_per_record_calibration,
         cal_frac=args.cal_frac,
         threshold_quantile=args.threshold_quantile,
+        threshold_method=args.threshold_method,
+        conformal_alpha=args.conformal_alpha,
+        calibration_outlier_frac=args.calibration_outlier_frac,
+        anomaly_model=args.anomaly_model,
+        knn_k=args.knn_k,
+        guard_s=args.guard_s,
+        use_policy_grouping=not args.no_policy_grouping,
+        af_treated_as=args.af_treated_as,
         include_adaptive=args.include_adaptive,
         window_limit=args.window_limit,
         abnormal_target_inhibit=args.abnormal_target_inhibit,

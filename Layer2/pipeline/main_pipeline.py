@@ -58,6 +58,11 @@ def calibrate_layer2(
     feature_names: Optional[Sequence[str]] = None,
     threshold_quantile: float = 0.999,
     feature_set: str = "all",
+    threshold_method: str = "conformal",
+    conformal_alpha: float = 0.10,
+    calibration_outlier_frac: float = 0.0,
+    anomaly_model: str = "mahalanobis",
+    knn_k: int = 5,
 ) -> BaselineCalibrator:
     """
     Learn the healthy baseline from feature dictionaries.
@@ -70,6 +75,11 @@ def calibrate_layer2(
         feature_names=feature_names,
         threshold_quantile=threshold_quantile,
         feature_set=feature_set,
+        threshold_method=threshold_method,
+        conformal_alpha=conformal_alpha,
+        calibration_outlier_frac=calibration_outlier_frac,
+        anomaly_model=anomaly_model,
+        knn_k=knn_k,
     )
 
 

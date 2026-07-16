@@ -39,3 +39,26 @@ Desktop.ini
 # Local AI/context notes
 CLAUDE.md
 IMPLEMENTATION_BRIEF.md
+
+# --- Keep commits lean: ignore bulky / superseded / scratch docs ---
+
+# Layer 3: archived decks and superseded ZEROSHOT materials
+Layer3/reports/archive/
+
+# Binary decks (regenerate via tools if needed)
+Layer3/reports/*.pptx
+Layer3/reports/**/*.pptx
+
+# Long AI-review scratch (local only; use LAYER3_CONSOLIDATED_SUMMARY.md instead)
+Layer3/reports/LAYER3_SCIENTIFIC_REVIEW_BRIEF.md
+Layer3/reports/LAYER3_ISSUES_AND_CODE_CHANGES.md
+Layer3/reports/LAYER3_REVIEW_WEAKNESSES_C1_C5.md
+Layer3/tools/generate_zeroshot_supervisor_materials.py
+
+# Root reports: Word exports, dump logs, one-off docx scripts, policy figure dumps
+reports/*.docx
+reports/docx_*.txt
+reports/apply_*_docx.py
+reports/export_*_docx.py
+reports/update_ecg_summary_docx.py
+reports/layer2_policy/

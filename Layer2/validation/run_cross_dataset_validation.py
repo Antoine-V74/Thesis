@@ -428,6 +428,7 @@ def evaluate_record(
     cadence_observation_lookahead_s: float,
     cadence_min_safe_observations: int,
     cadence_require_last_observation_safe: bool,
+    cadence_phase_offset: int,
 ) -> List[Dict]:
     try:
         rec = wfdb.rdrecord(stem)
@@ -840,6 +841,8 @@ def evaluate_record(
     #   stimulation opportunity. The candidate beat itself is not analyzed
     #   before the trigger decision.
     if len(fast_peaks) and calibrators:
+        if not 0 <= int(cadence_phase_offset) < 8:
+            raise ValueError("cadence_phase_offset must be in [0, 7]")
         cadence_gates = {
             fset: ProspectiveCadenceGate(
                 cycle_length=8,
@@ -852,8 +855,10 @@ def evaluate_record(
         cadence_policy = (
             f"min{cadence_min_safe_observations}of7"
             f"_lastsafe{int(cadence_require_last_observation_safe)}"
+            f"_offset{int(cadence_phase_offset)}"
         )
         n_cadence_scored = 0
+        n_post_calibration_triggers = 0
         for peak_idx, t_beat in enumerate(fast_peaks):
             if window_limit and n_cadence_scored >= window_limit:
                 break
@@ -868,6 +873,11 @@ def evaluate_record(
                 for gate in cadence_gates.values():
                     gate.reset()
                 continue
+
+            if n_post_calibration_triggers < int(cadence_phase_offset):
+                n_post_calibration_triggers += 1
+                continue
+            n_post_calibration_triggers += 1
 
             any_gate = next(iter(cadence_gates.values()))
             is_candidate = any_gate.next_phase == any_gate.cycle_length
@@ -898,6 +908,7 @@ def evaluate_record(
                     "benchmark_mode": mode,
                     "eval_mode": "fast_causal_cadence_1of8",
                     "cadence_policy": cadence_policy,
+                    "cadence_phase_offset": int(cadence_phase_offset),
                     "cadence_observation_lookahead_s": cadence_observation_lookahead_s,
                     "same_beat_fast_ok": same_ok,
                     "same_beat_fast_reason": same_reason,
@@ -999,6 +1010,7 @@ def run_benchmark(
     cadence_observation_lookahead_s: float,
     cadence_min_safe_observations: int,
     cadence_require_last_observation_safe: bool,
+    cadence_phase_offset: int,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "benchmark.log"
@@ -1062,6 +1074,7 @@ def run_benchmark(
                     cadence_observation_lookahead_s=cadence_observation_lookahead_s,
                     cadence_min_safe_observations=cadence_min_safe_observations,
                     cadence_require_last_observation_safe=cadence_require_last_observation_safe,
+                    cadence_phase_offset=cadence_phase_offset,
                 )
                 all_rows.extend(rows)
 
@@ -1287,6 +1300,16 @@ def main(argv=None) -> None:
         action="store_true",
         help="Allow stimulation even if the 7th observation beat was unsafe.",
     )
+    p.add_argument(
+        "--cadence-phase-offset",
+        type=int,
+        default=0,
+        help=(
+            "Shift the prospective 1-in-8 cadence by skipping this many "
+            "post-calibration detected R peaks before starting the 7-beat "
+            "observation cycle. Use 0..7 to test all beat phases."
+        ),
+    )
     p.add_argument("--species", default="human")
     p.add_argument(
         "--abnormal-target", type=float, default=0.95,
@@ -1329,6 +1352,7 @@ def main(argv=None) -> None:
         cadence_observation_lookahead_s=args.cadence_observation_lookahead_s,
         cadence_min_safe_observations=args.cadence_min_safe_observations,
         cadence_require_last_observation_safe=not args.cadence_allow_unsafe_last_observation,
+        cadence_phase_offset=args.cadence_phase_offset,
     )
 
 

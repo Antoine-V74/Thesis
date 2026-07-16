@@ -10,12 +10,12 @@ Existing files kept/reused:
 
 Added / patched files:
 - `build_window_index.py`
-- `layer3_embedding_mahalanobis.py`
+- `pipeline/layer3_embedding_mahalanobis.py` (Mahalanobis and kNN healthy-baseline scorers)
 - `layer3_validation_utils.py`
-- `layer3_pretrain.py` (patched for determinism, mmap, logger, `encoder_last.pt`)
-- `layer3_validate.py`
-- `layer3_validate_beat_sync.py`
-- `compare_layer2_layer3.py`
+- `tools/pretrain_encoder.py` (patched for determinism, mmap, logger, `encoder_last.pt`)
+- `validation/run_window_validation.py`
+- `validation/run_beat_validation.py`
+- `tools/compare_layer2_layer3.py`
 - `smoke_test_layer3.py` (synthetic end-to-end test)
 
 ## Important behavior
@@ -42,7 +42,7 @@ Added / patched files:
   simulate a strict real-time gate.
 - `build_window_index.py` emits **both** validation columns (`start_sample`,
   `end_sample`, etc. in native fs) **and** the pretraining columns required by
-  `layer3_pretrain.py`: `record_id`, `signal_path`, `start_idx`, `n_samples`
+  `tools/pretrain_encoder.py`: `record_id`, `signal_path`, `start_idx`, `n_samples`
   (in cached fs).
 
 ## New flags worth knowing
@@ -52,8 +52,12 @@ Added / patched files:
 | `--seed N`              | pretrain / validate / beat-sync | deterministic seed for sampler, dataset, and torch |
 | `--deterministic`       | pretrain / validate / beat-sync | enable PyTorch deterministic algorithms |
 | `--guard-s S`           | validate / beat-sync            | seconds of guard between calibration and test (default = `--window-s`) |
+| `--anomaly-model M`     | validate / beat-sync            | `mahalanobis` or `knn` healthy-baseline embedding scorer |
+| `--knn-k K`             | validate / beat-sync            | neighbors for kNN anomaly scoring |
+| `--calibration-outlier-frac F` | validate / beat-sync     | remove top-F most anomalous fit embeddings before refitting baseline |
 | `--num-workers N`       | pretrain                        | DataLoader workers; default 0 (CPU laptop / Windows safe) |
 | `--no-mmap`             | pretrain                        | disable mmap loading of cached `.npy` records |
+| `--positive-mode M`     | pretrain                        | `same_window` safer default, `same_record` CLOCS-style ablation |
 | `--healthy-only`        | pretrain                        | restrict pretraining to windows with `is_healthy_window=True` if column present |
 | `--max-windows N`       | pretrain                        | cap pretraining windows for smoke testing |
 | `--max-records N`       | validate / beat-sync            | cap records (preserves per-record calibration math); preferred over `--max-windows` |
@@ -71,14 +75,13 @@ Output column naming is consistent with Layer 2:
   `unscored_insufficient_healthy_calibration`}
 - `split` ∈ {`fit`, `val`, `calibration_excluded`, `guard_excluded`, `test`,
   `unscored_insufficient_healthy_calibration`}
-- `anomaly_score`, `threshold`, `score_over_threshold_ratio` are present as
-  aliases for the Mahalanobis-specific columns so downstream comparisons stay
-  generic.
+- `anomaly_score`, `threshold`, `score_over_threshold_ratio` are model-agnostic
+  columns so downstream comparisons work for Mahalanobis and kNN.
 
 ## Commands
 
 ```bash
-python Layer3/build_window_index.py \
+python Layer3/tools/build_window_index.py \
   --data-dir data \
   --datasets mitdb \
   --out-csv Results/layer3_validation/mitdb_windows.csv \
@@ -87,7 +90,7 @@ python Layer3/build_window_index.py \
 ```
 
 ```bash
-python Layer3/layer3_pretrain.py \
+python Layer3/tools/pretrain_encoder.py \
   --window-index Results/layer3_validation/mitdb_windows.csv \
   --epochs 100 \
   --batch-size 256 \
@@ -97,7 +100,7 @@ python Layer3/layer3_pretrain.py \
 ```
 
 ```bash
-python Layer3/layer3_validate.py \
+python Layer3/validation/run_window_validation.py \
   --data-dir data \
   --datasets mitdb \
   --window-index Results/layer3_validation/mitdb_windows.csv \
@@ -108,7 +111,7 @@ python Layer3/layer3_validate.py \
 ```
 
 ```bash
-python Layer3/layer3_validate_beat_sync.py \
+python Layer3/validation/run_beat_validation.py \
   --data-dir data \
   --datasets mitdb \
   --checkpoint Results/layer3_pretrain/encoder_last.pt \
@@ -120,7 +123,7 @@ python Layer3/layer3_validate_beat_sync.py \
 Adaptive Layer 1 trigger mode:
 
 ```bash
-python Layer3/layer3_validate_beat_sync.py \
+python Layer3/validation/run_beat_validation.py \
   --data-dir data \
   --datasets mitdb \
   --checkpoint Results/layer3_pretrain/encoder_last.pt \
@@ -132,7 +135,7 @@ python Layer3/layer3_validate_beat_sync.py \
 ```
 
 ```bash
-python Layer3/compare_layer2_layer3.py \
+python Layer3/tools/compare_layer2_layer3.py \
   --layer2-dir Results/final_mitbih_validation/beat_sync \
   --layer3-dir Results/layer3_validation/beat_sync \
   --out-dir Results/layer3_validation/comparison
@@ -143,7 +146,7 @@ same annotated beat samples used by Layer 3 oracle mode, use a bounded tolerant
 merge:
 
 ```bash
-python Layer3/compare_layer2_layer3.py \
+python Layer3/tools/compare_layer2_layer3.py \
   --layer2-dir Results/final_mitbih_validation/beat_sync \
   --layer3-dir Results/layer3_validation/beat_sync \
   --out-dir Results/layer3_validation/comparison \
@@ -156,7 +159,7 @@ Runs the entire pipeline against synthetic WFDB records in a temp directory.
 Takes ~30 s on CPU.
 
 ```bash
-python Layer3/smoke_test_layer3.py
+python Layer3/tools/smoke_test_layer3.py
 ```
 
 Set `LAYER3_SMOKE_KEEP=1` to keep the temp workspace for inspection.
@@ -175,7 +178,9 @@ Set `LAYER3_SMOKE_KEEP=1` to keep the temp workspace for inspection.
 `Results/layer3_validation/comparison/`
 - `combined_per_beat.csv`, `comparison_layer2_layer3.csv`,
   `final_comparison_table.csv`, `false_permits_detail.csv`,
-  `FINAL_COMPARISON_SUMMARY.md`
+  `layer2_permitted_subset.csv`,
+  `additional_layer3_vetoes_on_layer2_permits.csv`,
+  `layer3_added_value_summary.csv`, `FINAL_COMPARISON_SUMMARY.md`
 
 ## Dependencies
 

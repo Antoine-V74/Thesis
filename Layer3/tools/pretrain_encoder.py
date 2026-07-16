@@ -2,21 +2,20 @@
 Layer 3 — SSL contrastive pretraining loop.
 
 Pretrains the ECGEncoder1D on a pool of unlabeled ECG windows using
-NT-Xent contrastive loss. Two positive-sampling strategies, used together:
+NT-Xent contrastive loss. The default positive pair is two safe augmented
+views of the same window; same-record positives are an explicit ablation:
 
-    1. CLOCS-CMSC (Kiyasseh et al. 2021):
+    1. CLOCS-CMSC ablation (Kiyasseh et al. 2021):
        Positives are two non-overlapping segments from the SAME RECORD.
        Captures patient-invariance for free (same recording → same patient
        → same cardiac physiology, regardless of which 5s slice we picked).
 
-    2. SimCLR-style:
+    2. SimCLR-style default:
        Positives are two augmented views of the SAME WINDOW.
        Captures invariance to augmentation nuisances (noise, baseline
        wander, mild time warp).
 
-We combine both: for each anchor window, the positive is "another window
-from the same record, also augmented." Negatives are all other anchors
-in the batch.
+Negatives are all other anchors in the batch.
 
 This file provides:
     - NTXentLoss class
@@ -24,7 +23,7 @@ This file provides:
     - pretrain() training loop with periodic linear-probe validation
 
 Cluster usage:
-    python layer3_pretrain.py \\
+    python Layer3/tools/pretrain_encoder.py \\
         --features-csv path/to/window_index.csv \\
         --signal-dir   path/to/signals/ \\
         --epochs 100 \\
@@ -34,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,8 +46,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
+THIS_DIR = Path(__file__).resolve().parent
+LAYER3_ROOT = THIS_DIR.parent
+PROJECT_ROOT = LAYER3_ROOT.parent
+for path in (PROJECT_ROOT, LAYER3_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+from Layer3._bootstrap import setup_layer3_paths  # noqa: E402
+
+setup_layer3_paths(include_tools=True)
+
 from layer3_encoder import ECGEncoder1D, EncoderConfig, EncoderWithProjection, ProjectionHead
 from layer3_augmentations import AugmentConfig, ECGAugmentor
+from layer3_masked_ssl import MaskedSSLConfig, MaskedSubjectContrastiveModel
+from layer3_vicreg import VICRegConfig, VICRegModel
 
 
 # ---------------------------------------------------------------------------
@@ -88,8 +101,9 @@ class ContrastiveECGDataset(Dataset):
     """
     Yields (anchor_view, positive_view) pairs for contrastive pretraining.
 
-    Positive strategy: another window from the same record (CLOCS-CMSC),
-    then both anchor and positive are augmented independently.
+    Default positive strategy: same window with two independent safe
+    augmentations. Same-record positives are available as an explicit ablation,
+    but can pull healthy and abnormal beats from one record too close together.
 
     Expects a window index DataFrame with at least these columns:
         record_id   : identifier shared by windows from the same recording
@@ -105,7 +119,10 @@ class ContrastiveECGDataset(Dataset):
         self,
         window_index: pd.DataFrame,
         augmentor: Optional[ECGAugmentor] = None,
-        same_record_positive: bool = True,
+        same_record_positive: bool = False,
+        return_subject_id: bool = False,
+        subject_col: str = "record_id",
+        apply_augmentations: bool = True,
         rng_seed: int = 0,
         use_mmap: bool = True,
     ):
@@ -120,8 +137,15 @@ class ContrastiveECGDataset(Dataset):
             )
         self.augmentor = augmentor or ECGAugmentor()
         self.same_record_positive = same_record_positive
+        self.return_subject_id = bool(return_subject_id)
+        self.subject_col = str(subject_col)
+        self.apply_augmentations = bool(apply_augmentations)
         self.rng = np.random.default_rng(rng_seed)
         self.use_mmap = bool(use_mmap)
+        self.window_len = int(self.idx["n_samples"].iloc[0])
+        self.subject_to_id = {
+            value: i for i, value in enumerate(sorted(self.idx.get(self.subject_col, self.idx["record_id"]).astype(str).unique()))
+        }
 
         # Build index of window-row positions per record_id for fast positive sampling
         self.record_to_rows: dict = {}
@@ -169,12 +193,20 @@ class ContrastiveECGDataset(Dataset):
         anchor = (anchor - anchor.mean()) / (anchor.std() + 1e-8)
         positive = (positive - positive.mean()) / (positive.std() + 1e-8)
 
-        a_aug = self.augmentor.augment(anchor)
-        p_aug = self.augmentor.augment(positive)
+        if self.apply_augmentations:
+            a_aug = self.augmentor.augment(anchor)
+            p_aug = self.augmentor.augment(positive)
+        else:
+            a_aug = anchor
+            p_aug = positive
 
         # Return as (1, T) tensors — single channel
         a = torch.from_numpy(np.ascontiguousarray(a_aug, dtype=np.float32)).unsqueeze(0)
         p = torch.from_numpy(np.ascontiguousarray(p_aug, dtype=np.float32)).unsqueeze(0)
+        if self.return_subject_id:
+            subject_value = str(self.idx.iloc[idx].get(self.subject_col, rec))
+            sid = torch.tensor(self.subject_to_id.get(subject_value, 0), dtype=torch.long)
+            return a, p, sid
         return a, p
 
 
@@ -230,6 +262,16 @@ class PretrainConfig:
     seed: int = 0
     num_workers: int = 0
     deterministic: bool = False
+    positive_mode: str = "same_window"
+    ssl_objective: str = "ntxent"
+    mask_ratio: float = 0.75
+    mask_patch_size: int = 25
+    subject_contrastive_lambda: float = 0.30
+    subject_col: str = "record_id"
+    vicreg_sim_coeff: float = 25.0
+    vicreg_var_coeff: float = 25.0
+    vicreg_cov_coeff: float = 1.0
+    vicreg_expander_dims: str = "512,512,512"
 
 
 def pretrain(
@@ -259,8 +301,36 @@ def pretrain(
     set_seed(cfg.seed, deterministic=cfg.deterministic)
 
     enc = ECGEncoder1D(EncoderConfig(embedding_dim=cfg.embedding_dim))
-    proj = ProjectionHead(in_dim=cfg.embedding_dim, out_dim=cfg.projection_dim)
-    model = EncoderWithProjection(enc, proj).to(device)
+    ssl_objective = str(cfg.ssl_objective).lower()
+    if ssl_objective == "ntxent":
+        proj = ProjectionHead(in_dim=cfg.embedding_dim, out_dim=cfg.projection_dim)
+        model = EncoderWithProjection(enc, proj).to(device)
+    elif ssl_objective == "mae_subject_contrastive":
+        masked_cfg = MaskedSSLConfig(
+            embedding_dim=cfg.embedding_dim,
+            projection_dim=cfg.projection_dim,
+            mask_ratio=cfg.mask_ratio,
+            patch_size=cfg.mask_patch_size,
+            subject_contrastive_lambda=cfg.subject_contrastive_lambda,
+            temperature=cfg.temperature,
+        )
+        model = MaskedSubjectContrastiveModel(
+            encoder=enc,
+            output_len=int(getattr(train_dataset, "window_len", 1000)),
+            config=masked_cfg,
+        ).to(device)
+    elif ssl_objective == "vicreg":
+        expander_dims = [int(d) for d in str(cfg.vicreg_expander_dims).split(",") if str(d).strip()]
+        vicreg_cfg = VICRegConfig(
+            embedding_dim=cfg.embedding_dim,
+            expander_dims=expander_dims,
+            sim_coeff=cfg.vicreg_sim_coeff,
+            var_coeff=cfg.vicreg_var_coeff,
+            cov_coeff=cfg.vicreg_cov_coeff,
+        )
+        model = VICRegModel(encoder=enc, config=vicreg_cfg).to(device)
+    else:
+        raise ValueError(f"Unsupported --ssl-objective: {cfg.ssl_objective}")
 
     generator = make_torch_generator(cfg.seed)
     loader = DataLoader(
@@ -287,6 +357,10 @@ def pretrain(
                 "encoder_state_dict": enc.state_dict(),
                 "epoch": int(epoch),
                 "config": cfg.__dict__,
+                "ssl_objective": ssl_objective,
+                "decoder_discarded": ssl_objective == "mae_subject_contrastive",
+                "expander_discarded": ssl_objective == "vicreg",
+                "anomaly_score_note": "Downstream anomaly scores use encoder embedding distance only; reconstruction error / SSL projections are never used for permit/inhibit.",
             },
             path,
         )
@@ -302,12 +376,26 @@ def pretrain(
         ep_n = 0
         t0 = time.time()
 
-        for step, (a, p) in enumerate(loader):
+        for step, batch in enumerate(loader):
+            if ssl_objective == "mae_subject_contrastive":
+                a, p, subject_ids = batch
+            else:
+                a, p = batch
+                subject_ids = None
             a = a.to(device, non_blocking=True)
-            p = p.to(device, non_blocking=True)
-            _, z_a = model(a)
-            _, z_p = model(p)
-            loss = loss_fn(z_a, z_p)
+            if ssl_objective == "ntxent":
+                p = p.to(device, non_blocking=True)
+                _, z_a = model(a)
+                _, z_p = model(p)
+                loss = loss_fn(z_a, z_p)
+                loss_logs = {}
+            elif ssl_objective == "vicreg":
+                p = p.to(device, non_blocking=True)
+                loss, loss_logs = model(a, p)
+            else:
+                assert subject_ids is not None
+                subject_ids = subject_ids.to(device, non_blocking=True)
+                loss, loss_logs = model(a, subject_ids)
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -316,8 +404,22 @@ def pretrain(
             ep_loss += float(loss.item()) * a.size(0)
             ep_n += a.size(0)
             if step % cfg.log_every_n_steps == 0:
-                logger.info("epoch %d step %d loss=%.4f lr=%.2e",
-                            epoch, step, loss.item(), opt.param_groups[0]["lr"])
+                extra = ""
+                if ssl_objective == "mae_subject_contrastive" and loss_logs:
+                    extra = " recon=%.4f subj=%.4f mask=%.2f" % (
+                        float(loss_logs["reconstruction_loss"]),
+                        float(loss_logs["subject_contrastive_loss"]),
+                        float(loss_logs["mask_fraction"]),
+                    )
+                elif ssl_objective == "vicreg" and loss_logs:
+                    extra = " inv=%.4f var=%.4f cov=%.4f emb_std=%.3f" % (
+                        float(loss_logs["invariance_loss"]),
+                        float(loss_logs["variance_loss"]),
+                        float(loss_logs["covariance_loss"]),
+                        float(loss_logs["embedding_std"]),
+                    )
+                logger.info("epoch %d step %d loss=%.4f%s lr=%.2e",
+                            epoch, step, loss.item(), extra, opt.param_groups[0]["lr"])
 
         sched.step()
         avg_loss = ep_loss / max(1, ep_n)
@@ -363,12 +465,33 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--checkpoint-dir", type=str, default="./layer3_checkpoints")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:0. auto uses CUDA if available.")
+    parser.add_argument("--ssl-objective", choices=["ntxent", "mae_subject_contrastive", "vicreg"], default="ntxent",
+                        help="SSL objective. ntxent is contrastive (A); mae_subject_contrastive is ZEROSHOT-inspired "
+                             "masked reconstruction + subject contrastive (B); vicreg is non-contrastive VICReg (A1).")
+    parser.add_argument("--mask-ratio", type=float, default=0.75,
+                        help="Masked SSL fraction of temporal patches to mask (mae_subject_contrastive only).")
+    parser.add_argument("--mask-patch-size", type=int, default=25,
+                        help="Masked SSL temporal patch size in samples (25 samples = 200 ms at 125 Hz).")
+    parser.add_argument("--subject-contrastive-lambda", type=float, default=0.30,
+                        help="Weight on subject/record contrastive loss for mae_subject_contrastive.")
+    parser.add_argument("--subject-col", default="record_id",
+                        help="Window-index column used as subject/record identity for subject contrastive loss.")
+    parser.add_argument("--vicreg-sim-coeff", type=float, default=25.0,
+                        help="VICReg invariance (MSE) weight (vicreg only).")
+    parser.add_argument("--vicreg-var-coeff", type=float, default=25.0,
+                        help="VICReg variance (anti-collapse) weight (vicreg only).")
+    parser.add_argument("--vicreg-cov-coeff", type=float, default=1.0,
+                        help="VICReg covariance (decorrelation) weight (vicreg only).")
+    parser.add_argument("--vicreg-expander-dims", default="512,512,512",
+                        help="Comma-separated expander hidden dims for VICReg (vicreg only). Expander is discarded after pretraining.")
     parser.add_argument("--num-workers", type=int, default=0,
                         help="DataLoader worker processes. Use 0 for CPU-laptop / Windows compatibility.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--no-mmap", action="store_true",
                         help="Disable mmap signal loading (loads each .npy fully into RAM).")
+    parser.add_argument("--positive-mode", choices=["same_window", "same_record"], default="same_window",
+                        help="same_window is the safer default for anomaly-veto embeddings; same_record is a CLOCS-style ablation.")
     parser.add_argument("--healthy-only", action="store_true",
                         help="Restrict contrastive pretraining to is_healthy_window=True rows. "
                              "Use this if you want pretraining to see only baseline-safe morphology.")
@@ -393,8 +516,29 @@ def main():
     if args.max_windows is not None:
         idx_df = idx_df.head(int(args.max_windows)).copy()
     print(f"Loaded {len(idx_df)} windows across {idx_df['record_id'].nunique()} records.", flush=True)
+    if args.subject_col not in idx_df.columns:
+        raise SystemExit(f"--subject-col {args.subject_col!r} not found in window index columns")
 
-    ds = ContrastiveECGDataset(idx_df, rng_seed=args.seed, use_mmap=not args.no_mmap)
+    same_record_positive = args.positive_mode == "same_record"
+    if same_record_positive:
+        print(
+            "[WARN] --positive-mode same_record can pull healthy and abnormal beats from the same record together; treat as an ablation.",
+            flush=True,
+        )
+    if args.ssl_objective == "mae_subject_contrastive" and not args.healthy_only:
+        print(
+            "[WARN] mae_subject_contrastive uses record/subject labels. Without --healthy-only, same-subject positives may include abnormal windows; treat as a deliberate ablation.",
+            flush=True,
+        )
+    ds = ContrastiveECGDataset(
+        idx_df,
+        rng_seed=args.seed,
+        use_mmap=not args.no_mmap,
+        same_record_positive=same_record_positive,
+        return_subject_id=args.ssl_objective == "mae_subject_contrastive",
+        subject_col=args.subject_col,
+        apply_augmentations=args.ssl_objective in ("ntxent", "vicreg"),
+    )
     cfg = PretrainConfig(
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -403,6 +547,16 @@ def main():
         seed=args.seed,
         num_workers=args.num_workers,
         deterministic=args.deterministic,
+        positive_mode=args.positive_mode,
+        ssl_objective=args.ssl_objective,
+        mask_ratio=args.mask_ratio,
+        mask_patch_size=args.mask_patch_size,
+        subject_contrastive_lambda=args.subject_contrastive_lambda,
+        subject_col=args.subject_col,
+        vicreg_sim_coeff=args.vicreg_sim_coeff,
+        vicreg_var_coeff=args.vicreg_var_coeff,
+        vicreg_cov_coeff=args.vicreg_cov_coeff,
+        vicreg_expander_dims=args.vicreg_expander_dims,
     )
     pretrain(ds, cfg, device=args.device)
 

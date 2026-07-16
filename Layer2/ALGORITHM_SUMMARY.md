@@ -42,19 +42,21 @@ Decision logic lives in `pipeline/decision/`.
 Layer 2 does not maintain buffers internally. The caller (Pynapse/XR) should
 assemble:
 
-| Buffer | Size | Used for |
-|--------|------|----------|
-| ECG morphology window | past 5 s + post-R lookahead | `signal__*`, `morph__*` |
-| RR rhythm buffer | past 30 s of accepted peaks | `rr__` scalar stats |
-| Spectral HRV buffer | past 60 s of accepted peaks | `rr__hrv_*` (optional) |
-| Cadence safety state | last 7 unstimulated Layer 2 decisions | 1-in-8 prospective trigger |
+
+| Buffer                | Size                                  | Used for                   |
+| --------------------- | ------------------------------------- | -------------------------- |
+| ECG morphology window | past 5 s + post-R lookahead           | `signal__*`, `morph__*`    |
+| RR rhythm buffer      | past 30 s of accepted peaks           | `rr__` scalar stats        |
+| Spectral HRV buffer   | past 60 s of accepted peaks           | `rr__hrv_*` (optional)     |
+| Cadence safety state  | last 7 unstimulated Layer 2 decisions | 1-in-8 prospective trigger |
+
 
 Why separate horizons?
 
 - morphology needs only a short local ECG snippet around the trigger beat
 - RR stats need more beats but not the whole session
 - spectral HRV needs ~50 s for human LF bands; 60 s is enough without using
-  "all peaks since session start"
+"all peaks since session start"
 
 Reset RR buffers after gross artifact or missed-beat contamination rather than
 keeping the entire session forever.
@@ -73,11 +75,13 @@ Assembler: `pipeline/full_features.py`
 
 ### Feature groups
 
-| Prefix | Source | Needs R-peaks? | Safety meaning |
-|--------|--------|----------------|----------------|
-| `signal__` | wavelets, entropy, amplitude, SQI | No | signal quality / noise / energy |
-| `morph__` | beat shape around trigger | Yes | PVC / aberrant beat |
-| `rr__` | RR intervals / HRV | Yes (≥2 peaks) | rhythm deterioration |
+
+| Prefix     | Source                            | Needs R-peaks? | Safety meaning                  |
+| ---------- | --------------------------------- | -------------- | ------------------------------- |
+| `signal__` | wavelets, entropy, amplitude, SQI | No             | signal quality / noise / energy |
+| `morph__`  | beat shape around trigger         | Yes            | PVC / aberrant beat             |
+| `rr__`     | RR intervals / HRV                | Yes (≥2 peaks) | rhythm deterioration            |
+
 
 ### Why R-peaks are optional in the API
 
@@ -102,7 +106,7 @@ hf_noise_ratio, lf_wander_ratio (FFT SQI on filtered ECG)
 Justification:
 
 - wavelets separate QRS transients, slower waves, and baseline wander at
-  different scales
+different scales
 - entropy rises for chaotic/noisy signals (VFib surrogate, noise)
 - amplitude/energy catch gross signal changes
 - SQI catches electrode motion and baseline wander before rhythm logic runs
@@ -150,7 +154,7 @@ Justification:
 
 - scalar RR stats work on 30 s look-back and are real-time compatible
 - spectral HRV needs long RR history (~50 s human LF); often disabled in
-  beat-sync runtime (`compute_spectral_hrv=False`)
+beat-sync runtime (`compute_spectral_hrv=False`)
 
 ---
 
@@ -172,10 +176,16 @@ Run once at session start on **healthy** ECG windows from the same animal/sessio
 mean, std                 robust center/scale for all features
 inv_cov                   inverse covariance for Mahalanobis subset
 hard_rules                copied from config.py
-threshold_mahalanobis     multivariate distance cutoff
+threshold_mahalanobis     primary multivariate distance cutoff (Mahalanobis or kNN)
 threshold_max_zscore      worst single-feature z-score cutoff
 threshold_signal_proxy    diagnostic cutoff for signal group
 threshold_rr_proxy        diagnostic cutoff for RR group
+threshold_method          conformal (default) or healthy_quantile (legacy)
+conformal_alpha           target healthy false-inhibit rate (default 10%)
+calibration_outlier_frac  optional fraction of worst calibration windows removed before refit
+anomaly_model             mahalanobis (default) or knn
+knn_k                     neighbours for kNN scorer (default 5)
+knn_calibration_vectors   z-scored Mahalanobis-subset bank for kNN distance
 ```
 
 ### Train / validation split (70% / 30%)
@@ -184,8 +194,8 @@ Only on the **healthy baseline windows** passed to `fit()`, not on the whole
 dataset:
 
 ```text
-first 70% of healthy windows  -> learn mean/std/covariance
-last 30% of healthy windows   -> set thresholds
+first 70% of healthy windows  -> learn mean/std/covariance (after optional outlier pruning)
+last 30% of healthy windows   -> set thresholds on held-out healthy scores
 ```
 
 Temporal split (not random) mimics deployment: early baseline calibrates, later
@@ -193,6 +203,58 @@ baseline validates thresholds.
 
 Justification: avoids tuning thresholds on the exact same windows used to fit
 the model.
+
+### Threshold selection (conformal default)
+
+Default: **conformal threshold** on healthy validation scores (`threshold_method="conformal"`, `conformal_alpha=0.10`).
+
+```text
+sort validation primary distances (Mahalanobis or kNN)
+rank = ceil((n + 1) * (1 - alpha))
+threshold = score at that rank
+```
+
+Interpretation: target at most ~10% false inhibits on held-out healthy baseline
+windows (same idea as Layer 3 conformal calibration).
+
+Legacy mode: `threshold_method="healthy_quantile"` with `threshold_quantile=0.999`
+(~0.1% false inhibit target on validation).
+
+If conformal α is infeasible (too few validation windows), threshold is set to
+`inf` → all beats inhibit (fail-safe).
+
+### Optional calibration outlier pruning
+
+When `calibration_outlier_frac > 0` (e.g. 0.05):
+
+```text
+provisional fit on calibration split
+score each calibration window
+drop worst fraction by primary distance
+refit mean/std/covariance on kept windows only
+```
+
+Justification: occasional mislabeled or noisy windows during “healthy” baseline
+should not widen the baseline cloud or inflate the conformal threshold.
+
+### Primary scorer: Mahalanobis or kNN
+
+Both use the same z-scored `mahal_feature_names` subset.
+
+**Mahalanobis (default):**
+
+```text
+d = sqrt((x - mean)^T * inv_cov * (x - mean))
+```
+
+**kNN alternative** (`anomaly_model="knn"`):
+
+```text
+d = mean distance from x to k nearest calibration vectors in Mahalanobis-subset space
+```
+
+Use kNN when baseline window count is small or covariance is unstable; validation
+can compare both via `--anomaly-model knn`.
 
 ### Robust center and scale
 
@@ -227,7 +289,7 @@ Justification:
 
 - some features need fixed absolute limits, not statistical modeling
 - morphology varies a lot even in healthy beats; including it in Mahalanobis
-  inflated healthy false inhibits during benchmark tuning
+inflated healthy false inhibits during benchmark tuning
 
 ### Covariance and inversion
 
@@ -247,9 +309,9 @@ d = sqrt((x - mean)^T * inv_cov * (x - mean))
 Justification:
 
 - Mahalanobis detects unusual **combinations** of features, not just one feature
-  at a time
+at a time
 - shrinkage stabilizes covariance when feature count is high relative to
-  baseline window count
+baseline window count
 - ridge avoids singular matrices
 - if too few windows: fall back to diagonal mode (independent z-scores)
 
@@ -296,14 +358,17 @@ Justification:
 - do not depend on baseline covariance
 - inhibit reason names the exact feature (`hard_rule`)
 
-#### 2. Mahalanobis
+#### 2. Primary distance (Mahalanobis or kNN)
 
-Multivariate distance on `mahal_feature_names` subset.
+Multivariate distance on `mahal_feature_names` subset. `decide()` uses
+`primary_distance` from `score()` — Mahalanobis by default, or mean kNN distance
+when `anomaly_model="knn"`.
 
 Justification:
 
 - catches subtle combined abnormalities no single feature crosses alone
-- threshold set so ~99.9% of healthy validation windows pass (default quantile)
+- threshold set by conformal α on healthy validation (default 10% false inhibit)
+or legacy healthy quantile (0.999)
 
 #### 3. Max z-score
 
@@ -314,7 +379,7 @@ max_abs_zscore = max |z_i| over decision features
 Justification:
 
 - backup when one feature is extremely far but Mahalanobis is moderated by
-  correlations
+correlations
 - threshold at 90th percentile of healthy validation (`FROZEN_ZSCORE_QUANTILE`)
 
 When to use `decide()`:
@@ -363,11 +428,11 @@ Justification for hybrid mode:
 
 - beat-triggered stimulation needs to know if **this** R-peak is usable
 - a single missed beat can contaminate RR fractions for many seconds; hybrid
-  avoids blocking forever on stale RR history
+avoids blocking forever on stale RR history
 - signal problems (noise/morphology) are separated from rhythm problems via
-  `signal_mahal_proxy` before RR logic runs
+`signal_mahal_proxy` before RR logic runs
 - rewarming permits stimulation after N clean beats even if RR history is still
-  flagged unreliable
+flagged unreliable
 
 When to use `decide_hybrid()`:
 
@@ -395,7 +460,7 @@ Justification:
 - simpler group-level distances for logging
 - answer "was inhibit mostly signal-like or rhythm-like?"
 - `signal_mahal_proxy` is used as a gate step in `decide_hybrid()`, not in
-  plain `decide()`
+plain `decide()`
 
 These are **not** full separate Mahalanobis models per group (would need more
 calibration data and duplicate covariance structures).
@@ -421,13 +486,13 @@ candidate beat after its R-peak. Instead:
 Why this matters:
 
 - mechanical contraction follows the electrical R-peak too quickly to wait for
-  full morphology/feature analysis on the same beat
+full morphology/feature analysis on the same beat
 - the safety decision must therefore be ready before the stimulation candidate
 - the candidate beat still needs a valid fast R-peak trigger, but it is not used
-  for the full Layer 2 decision
+for the full Layer 2 decision
 - observation beats can use a longer causal post-R lookahead (default 400 ms,
-  capped before the next detected peak), because the decision is only needed
-  before the 8th beat
+capped before the next detected peak), because the decision is only needed
+before the 8th beat
 
 Validation modes using this idea:
 
@@ -442,14 +507,16 @@ run_cross_dataset_validation.py -> fast_causal_cadence_1of8
 
 Not learned from data. Set by safety policy and benchmark tuning.
 
-| Item | Role |
-|------|------|
-| `DEFAULT_HARD_RULES` | absolute veto limits before Mahalanobis |
-| `DEFAULT_MAHAL_EXCLUDE` | features removed from Mahalanobis |
-| `FROZEN_COUPLING_THRESHOLD` | PVC coupling ratio limit (0.80) |
-| `FROZEN_ZSCORE_QUANTILE` | max-zscore threshold quantile (0.90) |
-| `RRReliabilityConfig` | species-specific RR trust settings for hybrid mode |
-| `check_rr_reliability()` | computes reliability flags for `decide_hybrid()` |
+
+| Item                        | Role                                               |
+| --------------------------- | -------------------------------------------------- |
+| `DEFAULT_HARD_RULES`        | absolute veto limits before Mahalanobis            |
+| `DEFAULT_MAHAL_EXCLUDE`     | features removed from Mahalanobis                  |
+| `FROZEN_COUPLING_THRESHOLD` | PVC coupling ratio limit (0.80)                    |
+| `FROZEN_ZSCORE_QUANTILE`    | max-zscore threshold quantile (0.90)               |
+| `RRReliabilityConfig`       | species-specific RR trust settings for hybrid mode |
+| `check_rr_reliability()`    | computes reliability flags for `decide_hybrid()`   |
+
 
 Do not change frozen thresholds without re-running cross-dataset benchmarks.
 
@@ -477,30 +544,75 @@ Secondary: false inhibit rate (healthy state wrongly blocked).
 
 Layer 2 has two support areas beyond `pipeline/`:
 
-- **`validation/`** reruns the pipeline on ECG data and writes CSV metrics.
-- **`viz/`** consumes those CSVs and produces thesis figures and animations.
+- `**validation/`** reruns the pipeline on ECG data and writes CSV metrics.
+- `**viz/`** consumes those CSVs and produces thesis figures and animations.
 
 ### `validation/` — rerun pipeline on datasets
 
-| Script | Purpose | When to use |
-|--------|---------|-------------|
-| `run_beat_validation.py` | beat-sync and 1-in-8 cadence modes | Deployment-like benchmark |
-| `run_cross_dataset_validation.py` | MIT-BIH, NSTDB, SVDB, INCART, CUDB, VFDB | Generalization study |
-| `run_pareto_sweep.py` | unified Pareto entry point: quick / full / posthoc | Operating-point search |
-| `run_causal_lookahead_sweep.py` | sweep post-R lookahead ms | Causal delay budget study |
-| `common.py` | shared helpers (filtering, scoring, calibrator fit) | imported by validation scripts |
-| `pareto_quick.py` | fast 10-record MIT-BIH subset | used by `run_pareto_sweep.py quick` |
-| `pareto_posthoc.py` | threshold rescaling on saved per_beat.csv | used by `run_pareto_sweep.py posthoc` |
+
+| Script                            | Purpose                                                         | When to use                           |
+| --------------------------------- | --------------------------------------------------------------- | ------------------------------------- |
+| `run_beat_validation.py`          | beat-sync and 1-in-8 cadence modes                              | Deployment-like benchmark             |
+| `run_cross_dataset_validation.py` | MIT-BIH, NSTDB, SVDB, INCART, CUDB, VFDB                        | Generalization study                  |
+| `run_pareto_sweep.py`             | unified Pareto entry point: quick / full / posthoc              | Operating-point search                |
+| `run_causal_lookahead_sweep.py`   | sweep post-R lookahead ms                                       | Causal delay budget study             |
+| `common.py`                       | shared helpers (filtering, scoring, calibrator fit)             | imported by validation scripts        |
+| `layer2_validation_utils.py`      | conformal threshold, guard region, policy metrics, coverage CSV | imported by beat validation           |
+| `pareto_quick.py`                 | fast 10-record MIT-BIH subset                                   | used by `run_pareto_sweep.py quick`   |
+| `pareto_posthoc.py`               | threshold rescaling on saved per_beat.csv                       | used by `run_pareto_sweep.py posthoc` |
+
+
+**Beat validation outputs (enhanced):**
+
+```text
+per_beat.csv                 split, safety_group, is_healthy, primary_distance, knn, risk_family
+metrics_by_safety_group.csv  DANGEROUS / BENIGN_ABNORMAL / AF_CONTEXT / NOISE policy metrics
+threshold_coverage.csv       observed vs target healthy false-inhibit on test split
+risk_family_breakdown.csv    signal vs rhythm vs hard-rule inhibit reasons
+```
+
+**CLI flags (calibration / scoring):**
+
+```text
+--threshold-method conformal|healthy_quantile   default: conformal
+--conformal-alpha 0.10                          target healthy false-inhibit
+--calibration-outlier-frac 0.0                  optional prune before refit
+--anomaly-model mahalanobis|knn                 primary distance scorer
+--knn-k 5
+--guard-s 5.0                                   exclude post-calibration overlap from test metrics
+--legacy-labels                                 use healthy/abnormal instead of safety_group policy
+```
+
+**Record split labels** (per-record calibration mode):
+
+```text
+calibration   used to fit baseline
+guard         first guard_s seconds after calibration (excluded from test metrics)
+test          scored for safety metrics
+calibration_no_stim / guard_excluded rows logged but not counted as false permit/inhibit
+```
+
+Policy grouping reuses `Layer3/pipeline/label_grouping.py`:
+
+```text
+NORMAL           healthy baseline + expected permit
+DANGEROUS        VT/VFib → must inhibit (primary safety metric)
+BENIGN_ABNORMAL  isolated PVC etc. → policy-dependent
+AF_CONTEXT       AF spans → configurable (default: not counted as dangerous)
+NOISE            artifact → must inhibit
+```
 
 ### `viz/` — presentation figures
 
-| Script | Output | Purpose |
-|--------|--------|---------|
-| `make_all.py` | all figures below | one-command generation |
-| `plot_dataset_performance.py` | dataset / arrhythmia / worst-record plots | per-dataset diagnosis |
-| `plot_pareto.py` | operating curves + Pareto frontier | safety trade-off slides |
-| `plot_feature_auroc.py` | AUROC bars + top deviators | feature analysis |
-| `animate_beat_gate.py` | gate walkthrough GIF | explain algorithm visually |
+
+| Script                        | Output                                    | Purpose                    |
+| ----------------------------- | ----------------------------------------- | -------------------------- |
+| `make_all.py`                 | all figures below                         | one-command generation     |
+| `plot_dataset_performance.py` | dataset / arrhythmia / worst-record plots | per-dataset diagnosis      |
+| `plot_pareto.py`              | operating curves + Pareto frontier        | safety trade-off slides    |
+| `plot_feature_auroc.py`       | AUROC bars + top deviators                | feature analysis           |
+| `animate_beat_gate.py`        | gate walkthrough GIF                      | explain algorithm visually |
+
 
 Legacy scripts from the old `tools/` and `reports/` folders are in `archive/old_tools/` and
 `archive/old_reports/`.
@@ -510,10 +622,12 @@ Legacy scripts from the old `tools/` and `reports/` folders are in `archive/old_
 ## Quick Command Reference
 
 ```powershell
-# Beat-sync validation (deployment-like)
+# Beat-sync validation (deployment-like, conformal threshold + policy groups)
 .\.venv\Scripts\python.exe Layer2\validation\run_beat_validation.py `
   --data-dir data --datasets mit_bih_arrhythmia `
-  --out-dir Results\layer2_beat_validation
+  --out-dir Results\layer2_beat_validation `
+  --threshold-method conformal --conformal-alpha 0.10 `
+  --anomaly-model mahalanobis --guard-s 5.0
 
 # Cross-dataset
 .\.venv\Scripts\python.exe Layer2\validation\run_cross_dataset_validation.py `
@@ -529,3 +643,4 @@ Smoke imports:
 ```powershell
 .\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0,'Layer2/pipeline'); from main_pipeline import extract_layer2_features, calibrate_layer2, decide_layer2; print('OK')"
 ```
+

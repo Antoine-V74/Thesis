@@ -61,6 +61,11 @@ class CalibrationMixin:
         hard_rules: Optional[Dict[str, List[Optional[float]]]] = None,
         use_default_hard_rules: bool = True,
         feature_set: str = "all",
+        threshold_method: str = "conformal",
+        conformal_alpha: float = 0.10,
+        calibration_outlier_frac: float = 0.0,
+        anomaly_model: str = "mahalanobis",
+        knn_k: int = 5,
     ) -> BaselineCalibrator:
         """Fit baseline statistics on healthy windows."""
         if feature_set not in FEATURE_SET_CHOICES:
@@ -116,6 +121,14 @@ class CalibrationMixin:
         self.use_shrinkage = bool(use_shrinkage)
         self.val_frac = float(val_frac)
         self.threshold_quantile = float(threshold_quantile)
+        self.threshold_method = str(threshold_method).lower()
+        self.conformal_alpha = float(conformal_alpha)
+        self.calibration_outlier_frac = float(calibration_outlier_frac)
+        self.anomaly_model = str(anomaly_model).lower()
+        self.knn_k = int(knn_k)
+        self.n_outlier_removed = 0
+        self._force_diagonal = bool(force_diagonal)
+        self._ridge = float(ridge)
 
         n_cal = max(5, int(round(len(X) * (1.0 - val_frac))))
         X_cal = X[:n_cal]
@@ -123,7 +136,49 @@ class CalibrationMixin:
         self.n_calibration_windows = len(X_cal)
         self.n_validation_windows = len(X_val)
 
-        if use_robust:
+        outlier_frac = float(np.clip(calibration_outlier_frac, 0.0, 0.5))
+        if outlier_frac > 0.0 and len(X_cal) > 5:
+            self._fit_core_statistics(X_cal)
+            mahal_idx = [self.feature_names.index(f) for f in self.mahal_feature_names]
+            prov_scores = self._mahalanobis_batch_m(X_cal[:, mahal_idx])
+            keep_n = max(5, int(np.ceil((1.0 - outlier_frac) * len(X_cal))))
+            keep_n = min(keep_n, len(X_cal))
+            order = np.argsort(prov_scores, kind="mergesort")
+            keep = np.zeros(len(X_cal), dtype=bool)
+            keep[order[:keep_n]] = True
+            self.n_outlier_removed = int((~keep).sum())
+            X_cal = X_cal[keep]
+            self.n_calibration_windows = len(X_cal)
+
+        self._fit_core_statistics(X_cal)
+
+        mahal_idx = [self.feature_names.index(f) for f in self.mahal_feature_names]
+        X_m_val = X_val[:, mahal_idx]
+        primary_val = self._primary_distance_batch(X_m_val)
+        thr_info = self._select_primary_threshold(primary_val)
+        self.threshold_mahalanobis = float(thr_info["threshold"])
+        self._threshold_status = str(thr_info["status"])
+        self._target_false_inhibit = float(thr_info["target_false_inhibit"])
+
+        Z_val_all = (X_val - self.mean[None, :]) / self.std[None, :]
+        z_idx = self._decision_feature_indices()
+        max_z_val = np.max(np.abs(Z_val_all[:, z_idx]), axis=1)
+        self.threshold_max_zscore = float(np.quantile(max_z_val, zscore_quantile))
+
+        sig_idx = [i for i, n in enumerate(self.feature_names) if n.startswith("signal__")]
+        rr_idx = [i for i, n in enumerate(self.feature_names) if n.startswith("rr__")]
+        Z_sig_val = Z_val_all[:, sig_idx] if sig_idx else np.zeros((len(X_val), 1))
+        Z_rr_val = Z_val_all[:, rr_idx] if rr_idx else np.zeros((len(X_val), 1))
+        sig_proxy_val = np.sqrt(np.sum(Z_sig_val ** 2, axis=1))
+        rr_proxy_val = np.sqrt(np.sum(Z_rr_val ** 2, axis=1))
+        self.threshold_signal_proxy = float(np.quantile(sig_proxy_val, threshold_quantile))
+        self.threshold_rr_proxy = float(np.quantile(rr_proxy_val, threshold_quantile))
+
+        return self
+
+    def _fit_core_statistics(self: BaselineCalibrator, X_cal: np.ndarray) -> None:
+        """Fit location/scale/covariance and optional kNN bank from calibration rows."""
+        if self.use_robust:
             center = np.median(X_cal, axis=0)
             mad = np.median(np.abs(X_cal - center[None, :]), axis=0)
             feat_range = np.percentile(X_cal, 95, axis=0) - np.percentile(X_cal, 5, axis=0)
@@ -140,7 +195,10 @@ class CalibrationMixin:
         X_m_cal = X_cal[:, mahal_idx]
         Z_m_cal = (X_m_cal - center[mahal_idx][None, :]) / scale[mahal_idx][None, :]
         d_m = len(mahal_idx)
+        n_cal = len(X_cal)
         n_required = max(2 * d_m, 30)
+        ridge = float(getattr(self, "_ridge", 1e-4))
+        force_diagonal = bool(getattr(self, "_force_diagonal", False))
 
         if force_diagonal or n_cal < n_required or d_m < 2:
             self.use_diagonal = True
@@ -148,31 +206,53 @@ class CalibrationMixin:
             self.inv_cov = np.zeros((d_m, d_m))
         else:
             self.use_diagonal = False
-            corr = estimate_covariance(Z_m_cal, use_shrinkage, ridge)
+            corr = estimate_covariance(Z_m_cal, self.use_shrinkage, ridge)
             inv_corr = regularized_inv(corr, ridge=ridge)
             inv_s = 1.0 / scale[mahal_idx]
             self.inv_cov = inv_s[:, None] * inv_corr * inv_s[None, :]
             self.diag_inv_cov = inv_s ** 2
 
-        X_m_val = X_val[:, mahal_idx]
-        mahal_val = self._mahalanobis_batch_m(X_m_val)
-        self.threshold_mahalanobis = float(np.quantile(mahal_val, threshold_quantile))
+        if self.anomaly_model == "knn":
+            self.knn_calibration_vectors = Z_m_cal.copy()
+        else:
+            self.knn_calibration_vectors = np.zeros((0, d_m))
 
-        Z_val_all = (X_val - center[None, :]) / scale[None, :]
-        z_idx = self._decision_feature_indices()
-        max_z_val = np.max(np.abs(Z_val_all[:, z_idx]), axis=1)
-        self.threshold_max_zscore = float(np.quantile(max_z_val, zscore_quantile))
+    def _select_primary_threshold(self: BaselineCalibrator, val_scores: np.ndarray) -> dict:
+        import sys
+        from pathlib import Path
+        _root = Path(__file__).resolve().parents[3]
+        _l2_val = _root / "Layer2" / "validation"
+        if str(_l2_val) not in sys.path:
+            sys.path.insert(0, str(_l2_val))
+        from layer2_validation_utils import select_decision_threshold  # noqa: WPS433
 
-        sig_idx = [i for i, n in enumerate(self.feature_names) if n.startswith("signal__")]
-        rr_idx = [i for i, n in enumerate(self.feature_names) if n.startswith("rr__")]
-        Z_sig_val = Z_val_all[:, sig_idx] if sig_idx else np.zeros((len(X_val), 1))
-        Z_rr_val = Z_val_all[:, rr_idx] if rr_idx else np.zeros((len(X_val), 1))
-        sig_proxy_val = np.sqrt(np.sum(Z_sig_val ** 2, axis=1))
-        rr_proxy_val = np.sqrt(np.sum(Z_rr_val ** 2, axis=1))
-        self.threshold_signal_proxy = float(np.quantile(sig_proxy_val, threshold_quantile))
-        self.threshold_rr_proxy = float(np.quantile(rr_proxy_val, threshold_quantile))
+        info = select_decision_threshold(
+            val_scores,
+            method=self.threshold_method,
+            threshold_quantile=self.threshold_quantile,
+            conformal_alpha=self.conformal_alpha,
+        )
+        if info["status"] != "ok" or not np.isfinite(info["threshold"]):
+            info["threshold"] = float("inf")
+        return info
 
-        return self
+    def _knn_distance_batch(self: BaselineCalibrator, X_m: np.ndarray) -> np.ndarray:
+        if self.knn_calibration_vectors is None or self.knn_calibration_vectors.size == 0:
+            return np.full(len(X_m), np.inf, dtype=float)
+        ref = self.knn_calibration_vectors
+        k_eff = int(max(1, min(int(self.knn_k), ref.shape[0])))
+        diff = X_m[:, None, :] - ref[None, :, :]
+        d = np.sqrt(np.maximum(np.sum(diff * diff, axis=2), 0.0))
+        nearest = np.partition(d, kth=k_eff - 1, axis=1)[:, :k_eff]
+        return nearest.mean(axis=1)
+
+    def _primary_distance_batch(self: BaselineCalibrator, X_m: np.ndarray) -> np.ndarray:
+        if self.anomaly_model == "knn":
+            center_m = self.mean[[self.feature_names.index(f) for f in self.mahal_feature_names]]
+            scale_m = self.std[[self.feature_names.index(f) for f in self.mahal_feature_names]]
+            z_m = (X_m - center_m[None, :]) / scale_m[None, :]
+            return self._knn_distance_batch(z_m)
+        return self._mahalanobis_batch_m(X_m)
 
     def calibrate_thresholds_for_abnormal_inhibit(
         self: BaselineCalibrator,
@@ -355,6 +435,13 @@ class CalibrationMixin:
             "threshold_signal_proxy": self.threshold_signal_proxy,
             "threshold_rr_proxy": self.threshold_rr_proxy,
             "threshold_quantile": self.threshold_quantile,
+            "threshold_method": getattr(self, "threshold_method", "conformal"),
+            "conformal_alpha": getattr(self, "conformal_alpha", 0.10),
+            "calibration_outlier_frac": getattr(self, "calibration_outlier_frac", 0.0),
+            "anomaly_model": getattr(self, "anomaly_model", "mahalanobis"),
+            "knn_k": getattr(self, "knn_k", 5),
+            "n_outlier_removed": getattr(self, "n_outlier_removed", 0),
+            "knn_calibration_vectors": getattr(self, "knn_calibration_vectors", np.zeros((0, 0))).tolist(),
             "use_diagonal": self.use_diagonal,
             "use_robust": self.use_robust,
             "use_shrinkage": self.use_shrinkage,
@@ -380,6 +467,13 @@ class CalibrationMixin:
             threshold_signal_proxy=float(d.get("threshold_signal_proxy", 1e9)),
             threshold_rr_proxy=float(d.get("threshold_rr_proxy", 1e9)),
             threshold_quantile=float(d["threshold_quantile"]),
+            threshold_method=str(d.get("threshold_method", "conformal")),
+            conformal_alpha=float(d.get("conformal_alpha", 0.10)),
+            calibration_outlier_frac=float(d.get("calibration_outlier_frac", 0.0)),
+            anomaly_model=str(d.get("anomaly_model", "mahalanobis")),
+            knn_k=int(d.get("knn_k", 5)),
+            n_outlier_removed=int(d.get("n_outlier_removed", 0)),
+            knn_calibration_vectors=np.asarray(d.get("knn_calibration_vectors", []), dtype=float),
             use_diagonal=bool(d["use_diagonal"]),
             use_robust=bool(d.get("use_robust", True)),
             use_shrinkage=bool(d.get("use_shrinkage", True)),

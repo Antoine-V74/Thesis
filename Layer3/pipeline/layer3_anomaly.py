@@ -1,7 +1,12 @@
 """
 Layer 3 — anomaly head on top of the pretrained encoder.
 
-Implements Deep SVDD (Ruff et al. 2018) as the anomaly mechanism:
+Implements Deep SVDD (Ruff et al. 2018) as an optional ablation:
+
+    The main Layer 3 path is a learned ECG embedding anomaly veto with a
+    healthy-baseline distance model such as Mahalanobis or kNN. Deep SVDD is
+    useful for comparison, but should not be presented as the primary runtime
+    method unless it wins that ablation.
 
     Given a pretrained encoder f(x) → R^d,
     learn a small head g(z) → R^k that maps healthy-rat embeddings

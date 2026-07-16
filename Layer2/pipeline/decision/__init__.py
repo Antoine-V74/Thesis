@@ -51,6 +51,13 @@ class BaselineCalibrator(CalibrationMixin, GateMixin):
     threshold_signal_proxy: float = 0.0
     threshold_rr_proxy: float = 0.0
     threshold_quantile: float = 0.999
+    threshold_method: str = "conformal"
+    conformal_alpha: float = 0.10
+    calibration_outlier_frac: float = 0.0
+    anomaly_model: str = "mahalanobis"
+    knn_k: int = 5
+    n_outlier_removed: int = 0
+    knn_calibration_vectors: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
     use_diagonal: bool = False
     use_robust: bool = True
     use_shrinkage: bool = True

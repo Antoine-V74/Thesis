@@ -6,7 +6,7 @@ contrastive pretraining.
 Outputs both validation-friendly WFDB/native columns:
     dataset, record, record_path, start_sample, end_sample, center_sample, labels...
 
-and pretraining-friendly columns expected by existing layer3_pretrain.py:
+and pretraining-friendly columns expected by tools/pretrain_encoder.py:
     record_id, signal_path, start_idx, n_samples
 
 If --signal-dir is omitted, a sibling folder next to --out-csv is used and one
@@ -26,23 +26,79 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-# Allow running as `python Layer3/build_window_index.py` from repo root.
+# Allow running as `python Layer3/tools/build_window_index.py` from repo root.
 THIS_DIR = Path(__file__).resolve().parent
-if str(THIS_DIR) not in sys.path:
-    sys.path.insert(0, str(THIS_DIR))
+LAYER3_ROOT = THIS_DIR.parent
+PROJECT_ROOT = LAYER3_ROOT.parent
+for path in (PROJECT_ROOT, LAYER3_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
-from layer3_validation_utils import (  # noqa: E402
-    DEFAULT_NORMAL_SYMBOLS,
-    KNOWN_BEAT_SYMBOLS,
-    NON_BEAT_SYMBOLS,
-    get_logger,
-    import_wfdb,
-    parse_csv_list,
-    resample_if_needed,
-    robust_normalize_window,
-)
+from Layer3._bootstrap import setup_layer3_paths  # noqa: E402
 
-LOG = get_logger("layer3.build_index")
+setup_layer3_paths(include_validation=False, include_tools=True)
+
+from label_grouping import NORMAL, UNLABELED, build_rhythm_spans, group_for_window  # noqa: E402
+
+DEFAULT_NORMAL_SYMBOLS = {"N"}
+KNOWN_BEAT_SYMBOLS = {
+    "N", "L", "R", "B", "A", "a", "J", "S", "V", "r", "F", "e", "j", "n", "E", "/", "f", "Q", "?", "!"
+}
+NON_BEAT_SYMBOLS = {"+", "~", "|", "\"", "=", "x", "(", ")", "[", "]"}
+
+
+def parse_csv_list(value: str | Sequence[str]) -> List[str]:
+    if isinstance(value, str):
+        return [chunk.strip() for chunk in value.split(",") if chunk.strip()]
+    out: List[str] = []
+    for item in value:
+        out.extend(parse_csv_list(item))
+    return out
+
+
+def import_wfdb():
+    try:
+        import wfdb  # type: ignore
+        return wfdb
+    except Exception as exc:
+        raise RuntimeError("This script needs WFDB. Install with: pip install wfdb") from exc
+
+
+def resample_if_needed(x: np.ndarray, fs: float, target_fs: Optional[float]) -> np.ndarray:
+    if target_fs is None or abs(float(fs) - float(target_fs)) < 1e-6:
+        return x
+    try:
+        from scipy.signal import resample_poly
+    except Exception as exc:
+        raise RuntimeError("Resampling requested but scipy is not installed.") from exc
+    from math import gcd
+    fs_i = int(round(float(fs)))
+    target_i = int(round(float(target_fs)))
+    g = gcd(fs_i, target_i)
+    return resample_poly(x, target_i // g, fs_i // g).astype(np.float32)
+
+
+def robust_normalize_window(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    x = x - np.nanmedian(x)
+    mad = np.nanmedian(np.abs(x - np.nanmedian(x)))
+    scale = 1.4826 * mad
+    if not np.isfinite(scale) or scale < eps:
+        scale = float(np.nanstd(x))
+    if not np.isfinite(scale) or scale < eps:
+        scale = 1.0
+    return np.nan_to_num(x / scale, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
+class _Logger:
+    def info(self, msg: str, *args) -> None:
+        print("[INFO] " + (msg % args if args else msg), file=sys.stderr)
+
+    def warning(self, msg: str, *args) -> None:
+        print("[WARN] " + (msg % args if args else msg), file=sys.stderr)
+
+
+LOG = _Logger()
 
 
 def find_wfdb_records(dataset_dir: Path) -> List[str]:
@@ -159,6 +215,8 @@ def build_index_for_record(
     record: str,
     window_s: float,
     stride_s: float,
+    dual_scale: bool,
+    short_window_s: float,
     ann_ext: str,
     normal_symbols: set[str],
     min_beats: int,
@@ -195,13 +253,18 @@ def build_index_for_record(
         ann_samples = ann_samples[order]
         ann_symbols = [ann_symbols[i] for i in order]
         ann_aux = [ann_aux[i] for i in order]
+    rhythm_spans = build_rhythm_spans(ann_samples, ann_symbols, ann_aux, native_sig_len)
 
     native_window_n = int(round(window_s * native_fs))
     native_stride_n = int(round(stride_s * native_fs))
     cache_window_n = int(round(window_s * cached_fs))
     cache_stride_n = int(round(stride_s * cached_fs))
+    native_short_window_n = int(round(short_window_s * native_fs))
+    cache_short_window_n = int(round(short_window_s * cached_fs))
     if native_window_n <= 1 or native_stride_n <= 0 or cache_window_n <= 1 or cache_stride_n <= 0:
         raise ValueError("window_s and stride_s must produce positive sample counts")
+    if dual_scale and (native_short_window_n <= 1 or cache_short_window_n <= 1):
+        raise ValueError("short_window_s must produce positive sample counts when --dual-scale is set")
 
     rows: List[Dict[str, object]] = []
     n_windows = max(0, (native_sig_len - native_window_n) // native_stride_n + 1)
@@ -222,6 +285,35 @@ def build_index_for_record(
             normal_symbols=normal_symbols,
             min_beats=min_beats,
         )
+        safety_group = group_for_window(
+            native_start,
+            native_end,
+            rhythm_spans,
+            ann_samples,
+            ann_symbols,
+            dataset=dataset,
+        )
+        # Safety grouping is the authority for Layer 3 calibration/evaluation.
+        # This correctly handles rhythm-only records (vfdb) and nstdb noise,
+        # where beat-symbol-only healthy labels are misleading.
+        label_info["is_healthy_window"] = bool(safety_group == NORMAL)
+        label_info["has_labels"] = bool(label_info.get("has_labels", False) or safety_group != UNLABELED)
+        center_native = native_start + native_window_n // 2
+        if dual_scale:
+            native_short_start = max(0, center_native - native_short_window_n // 2)
+            native_short_end = native_short_start + native_short_window_n
+            if native_short_end > native_sig_len:
+                native_short_end = native_sig_len
+                native_short_start = max(0, native_short_end - native_short_window_n)
+
+            center_cache = cache_start + cache_window_n // 2
+            cache_short_start = max(0, center_cache - cache_short_window_n // 2)
+            cache_short_end = cache_short_start + cache_short_window_n
+            if cache_short_end > cached_len:
+                cache_short_end = cached_len
+                cache_short_start = max(0, cache_short_end - cache_short_window_n)
+        else:
+            native_short_start = native_short_end = cache_short_start = cache_short_end = -1
         record_id = f"{dataset}/{record}"
         rows.append(
             {
@@ -237,20 +329,29 @@ def build_index_for_record(
                 "ann_ext": ann_ext,
                 "start_sample": int(native_start),
                 "end_sample": int(native_end),
-                "center_sample": int(native_start + native_window_n // 2),
+                "center_sample": int(center_native),
                 "start_s": float(native_start / native_fs),
                 "end_s": float(native_end / native_fs),
                 "center_s": float((native_start + native_window_n // 2) / native_fs),
-                # Cached-signal coordinate system expected by layer3_pretrain.py
+                # Cached-signal coordinate system expected by pretrain_encoder.py
                 "signal_path": signal_path,
                 "cached_fs": float(cached_fs),
                 "cached_signal_len": int(cached_len),
                 "start_idx": int(cache_start),
                 "n_samples": int(cache_window_n),
+                # Optional dual-scale metadata. The primary scoring/pretraining
+                # path still uses the rhythm-context window columns above.
+                "dual_scale": bool(dual_scale),
+                "short_window_s": float(short_window_s) if dual_scale else np.nan,
+                "short_start_sample": int(native_short_start),
+                "short_end_sample": int(native_short_end),
+                "short_start_idx": int(cache_short_start),
+                "short_n_samples": int(max(0, cache_short_end - cache_short_start)),
                 # Window parameters and labels
                 "window_s": float(window_s),
                 "stride_s": float(stride_s),
                 "lead_index": int(lead_index),
+                "safety_group": safety_group,
                 **label_info,
             }
         )
@@ -262,14 +363,21 @@ def main() -> None:
     p.add_argument("--data-dir", required=True, help="Root data directory, e.g. data")
     p.add_argument("--datasets", nargs="+", required=True, help="Dataset folder names, comma-separated or space-separated")
     p.add_argument("--out-csv", required=True, help="Output CSV path")
-    p.add_argument("--window-s", type=float, default=5.0)
+    p.add_argument("--window-s", type=float, default=8.0,
+                   help="Primary rhythm-context window length in seconds (default: 8.0).")
     p.add_argument("--stride-s", type=float, default=1.0)
+    p.add_argument("--dual-scale", action="store_true",
+                   help="Also emit metadata for a short beat-scale window centered within each rhythm window.")
+    p.add_argument("--short-window-s", type=float, default=1.0,
+                   help="Short beat-scale window length used with --dual-scale.")
     p.add_argument("--ann-ext", default="atr", help="WFDB annotation extension, e.g. atr for MIT-BIH")
-    p.add_argument("--normal-symbols", default="N", help="Comma-separated beat symbols treated as healthy baseline")
+    p.add_argument("--normal-symbols", default="N",
+                   help="Legacy beat-symbol healthy rule used only for beat-count diagnostics. Safety calibration uses safety_group==NORMAL from label_grouping.py.")
     p.add_argument("--min-beats", type=int, default=1, help="Minimum labeled beats required to call a window healthy")
     p.add_argument("--max-records", type=int, default=None)
     p.add_argument("--lead-index", type=int, default=0)
-    p.add_argument("--target-fs", type=float, default=250.0, help="Cached .npy signal fs for pretraining. Set <=0 to keep native fs.")
+    p.add_argument("--target-fs", type=float, default=125.0,
+                   help="Cached .npy signal fs for pretraining (default: 125 Hz for 8 s rhythm windows). Set <=0 to keep native fs.")
     p.add_argument("--signal-dir", default=None, help="Where to cache .npy full-record signals. Default: <out-csv parent>/signals_npy")
     p.add_argument("--no-signal-cache", action="store_true", help="Only build validation index; signal_path/start_idx remain unusable for pretraining.")
     p.add_argument("--overwrite-signal-cache", action="store_true")
@@ -309,6 +417,8 @@ def main() -> None:
                     record=record,
                     window_s=args.window_s,
                     stride_s=args.stride_s,
+                    dual_scale=args.dual_scale,
+                    short_window_s=args.short_window_s,
                     ann_ext=args.ann_ext,
                     normal_symbols=normal_symbols,
                     min_beats=args.min_beats,

@@ -1,22 +1,14 @@
 # Layer 2 - Feature Safety Gate
 
-
-
 Layer 2 computes ECG features, calibrates a healthy baseline, and returns
 
 permit/inhibit decisions. It never commands stimulation.
-
-
 
 **Read first:** [ALGORITHM_SUMMARY.md](ALGORITHM_SUMMARY.md) — full algorithm,
 
 justifications, `decide()` vs `decide_hybrid()`.
 
-
-
 ## Folder Map
-
-
 
 ```text
 
@@ -32,11 +24,7 @@ Layer2/
 
 ```
 
-
-
 ## Core Pipeline
-
-
 
 | Path | Purpose |
 
@@ -52,21 +40,17 @@ Layer2/
 
 | `pipeline/README.md` | Short pipeline reference |
 
-
-
 ## What to run
 
-
-
 ### Validation (reruns feature extraction + gate)
-
-
 
 | Command | Script |
 
 |---------|--------|
 
 | Beat-sync (deployment-like) | `validation/run_beat_validation.py` |
+
+| Shared validation helpers | `validation/layer2_validation_utils.py` |
 
 | Cross-dataset | `validation/run_cross_dataset_validation.py` |
 
@@ -78,11 +62,7 @@ The deployment-like scripts also report a prospective cadence mode: observe 7
 unstimulated beats with a longer causal lookahead, then stimulate only the 8th
 beat if at least 6 of those decisions were safe and the 7th beat was safe.
 
-
-
 ### Figures (CSV in -> plots out)
-
-
 
 | Command | Script |
 
@@ -98,25 +78,23 @@ beat if at least 6 of those decisions were safe and the 7th beat was safe.
 
 | Gate walkthrough animation | `viz/animate_beat_gate.py` |
 
-
-
 See [viz/README.md](viz/README.md) for details.
-
-
 
 ## Main commands
 
-
-
 ```powershell
 
-# Beat-synchronous validation
+# Beat-synchronous validation (conformal threshold + policy groups)
 
 .\.venv\Scripts\python.exe Layer2\validation\run_beat_validation.py `
 
     --data-dir data --datasets mit_bih_arrhythmia `
 
-    --out-dir Results\layer2_beat_validation
+    --out-dir Results\layer2_beat_validation `
+
+    --threshold-method conformal --conformal-alpha 0.10 `
+
+    --guard-s 5.0
 
 
 

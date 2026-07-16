@@ -17,7 +17,7 @@ AND Layer 3 permits, if Layer 3 is enabled.
 
 Uncertainty, calibration periods, model failure, missing data, or runtime failure must inhibit stimulation.
 
-Human MIT-BIH validation is proxy validation only. Animal deployment requires per-session animal ECG calibration and prospective animal validation.
+Human MIT-BIH validation is proxy validation only. Primary target is human experimental/clinical ECG with per-session calibration; animal transfer remains an architectural option requiring prospective validation.
 
 ## High-Level Pipeline
 
@@ -34,7 +34,7 @@ Beat-synchronous ECG window extraction
   ↓
 Per-record healthy baseline model
   ↓
-Mahalanobis anomaly score
+Mahalanobis or kNN anomaly score
   ↓
 Threshold from held-out healthy calibration data
   ↓
@@ -83,26 +83,31 @@ Important caveat: the current Layer 1 helper uses the existing offline zero-phas
 
 ## ECG Window Choice
 
-Layer 3 originally supported longer windows such as 5 s. These are useful for research and debugging, but they performed poorly for the stimulation-gate task because the morphology of the current beat can be diluted by surrounding beats.
+Layer 2 and Layer 3 are **independent** vetoes. Layer 3 must therefore carry
+**rhythm information in its own input**, not borrow RR features from Layer 2.
 
-The current preferred beat-synchronous configuration uses short windows:
+**Primary configuration (protocol freeze, July 2026):**
+
+```text
+--window-s 8
+--target-fs 125
+```
+
+An 8 s beat-synchronous strip contains several RR intervals, so rate,
+regularity, and short rhythm context are present in the raw waveform. This
+matches SSL pretraining (8 s @ 125 Hz) and avoids a train/eval scale mismatch.
+
+**Optional morphology ablation:**
 
 ```text
 --window-s 1
 ```
 
-The rationale is that stimulation safety depends strongly on local beat morphology:
+A 1 s window focuses on local QRS/T shape (width, slope, polarity, fusion).
+It is useful as an ablation, not as the primary independent Layer 3 claim.
 
-```text
-QRS width
-QRS slope
-polarity
-fusion morphology
-post-R morphology
-early repolarization behavior
-```
-
-A 1 s window focuses the embedding on the beat being evaluated rather than long patient or record context.
+**Future (not required before first cluster campaign):** dual-scale concat of
+1 s morphology + 8 s rhythm embeddings (`build_window_index.py --dual-scale`).
 
 ## Causality and Lookahead
 
@@ -189,23 +194,23 @@ The rationale is that an anomaly detector should learn the structure of healthy 
 
 This is an offline human ECG ablation because MIT-BIH labels are used to select healthy pretraining windows. It does not prove animal generalization. Animal deployment still requires animal-specific baseline calibration and prospective validation.
 
-## Healthy Baseline and Mahalanobis Scoring
+## Healthy Baseline and Embedding Anomaly Scoring
 
 After pretraining, each beat window is mapped to a 128-dimensional embedding. Layer 3 then fits a healthy baseline using calibration embeddings only.
 
 For each record/session:
 
 ```text
-healthy calibration embeddings -> mean vector + covariance matrix
+healthy calibration embeddings -> baseline anomaly model
 ```
 
-Each test embedding receives a Mahalanobis anomaly score:
+Each test embedding receives an anomaly score:
 
 ```text
-score = distance from healthy baseline, accounting for healthy covariance
+score = distance from healthy baseline in embedding space
 ```
 
-Mahalanobis distance is preferred over simple Euclidean distance because healthy ECG variation is correlated. For example:
+Two main scoring options are evaluated. Mahalanobis distance fits a mean and covariance to the healthy embedding cloud. It is simple, transparent, and accounts for correlated healthy variation. For example:
 
 ```text
 QRS amplitude and slope vary together.
@@ -215,6 +220,8 @@ Patient/session morphology shifts multiple embedding dimensions together.
 ```
 
 Euclidean distance treats all directions equally and effectively assumes a circular healthy cloud. Mahalanobis distance accounts for the shape of the healthy cloud. Variation along normal healthy directions is penalized less than variation in unusual directions.
+
+kNN distance scores a new embedding by its distance to nearby healthy calibration embeddings. It is nonparametric and can handle a healthy baseline with multiple normal submodes better than a single Gaussian model. This makes kNN a strong comparison to Mahalanobis.
 
 ## Threshold Selection
 
@@ -270,6 +277,18 @@ The guard region prevents near-identical overlapping ECG windows from appearing 
 
 Calibration periods never trigger stimulation. They are reported as calibration/no-stimulation periods.
 
+Calibration can be contaminated by PVCs, noise, or poor contact even when the segment is intended to be healthy. The validation code therefore supports robust calibration:
+
+```text
+fit provisional baseline
+score fit embeddings
+remove top outlier fraction
+refit baseline
+set threshold on held-out healthy validation embeddings
+```
+
+This is controlled by `--calibration-outlier-frac`.
+
 ## Metrics
 
 Layer 3 reports stimulation-gate metrics rather than clinical classifier metrics:
@@ -305,6 +324,14 @@ Layer 3 can only remove stimulation opportunities.
 
 Layer 2 and Layer 3 are complementary. Layer 2 provides interpretable RR and morphology features, while Layer 3 provides learned morphology anomaly sensitivity.
 
+The most important deployment analysis is conditional:
+
+```text
+Among beats Layer 2 permits, does Layer 3 catch additional abnormal beats?
+```
+
+The comparison tool reports this as `layer3_on_layer2_permitted_beats` and writes `layer3_added_value_summary.csv`.
+
 Fusion beats remain difficult for Layer 3 because they contain both normal and ventricular activation components. This supports using Layer 3 as a veto alongside Layer 2 rather than as a standalone controller.
 
 ## Current Best Configuration Under Evaluation
@@ -316,14 +343,14 @@ healthy-only SSL pretraining
 1 s beat-synchronous window
 Layer 1 adaptive gated trigger mode
 causal window with limited post-R lookahead
-per-record healthy Mahalanobis baseline
+per-record healthy Mahalanobis or kNN baseline
 threshold quantile 0.90
 ```
 
 Example command:
 
 ```bash
-python Layer3/layer3_validate_beat_sync.py \
+python Layer3/validation/run_beat_validation.py \
   --data-dir data \
   --datasets mitdb \
   --checkpoint Results/layer3_pretrain_healthy_only_100ep_cuda_w1s/encoder_last.pt \
@@ -333,6 +360,8 @@ python Layer3/layer3_validate_beat_sync.py \
   --lookahead-ms 50 \
   --window-s 1 \
   --threshold-quantile 0.90 \
+  --anomaly-model mahalanobis \
+  --calibration-outlier-frac 0.05 \
   --per-record-calibration \
   --device cuda \
   --seed 0
@@ -362,3 +391,10 @@ Does the current stimulation opportunity resemble calibrated healthy ECG closely
 
 If yes, Layer 3 permits. If no, uncertain, or failed, Layer 3 inhibits.
 
+## Candidate Improvements
+
+Possible changes and improvements to this architecture (encoder, SSL objective,
+scoring model, thresholds, temporal aggregation, fusion, runtime, and
+evaluation), each with a rationale, safety analysis, and validation plan, are
+tracked in `LAYER3_ARCHITECTURE_IMPROVEMENTS.md`. That backlog is deliberately
+gated on measured false-permit improvements rather than intuition.

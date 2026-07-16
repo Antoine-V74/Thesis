@@ -37,18 +37,20 @@ from scipy.signal import butter, sosfiltfilt
 @dataclass
 class AugmentConfig:
     fs: int = 250
-    time_warp_range: float = 0.10        # ±10%
+    time_warp_range: float = 0.03
     noise_snr_db_range: tuple = (20.0, 35.0)
     wander_amp_range: tuple = (0.0, 0.05)
     wander_freq_range: tuple = (0.1, 0.5)
     bandpass_lo_range: tuple = (0.3, 0.8)
     bandpass_hi_range: tuple = (35.0, 50.0)
-    crop_frac_range: tuple = (0.85, 1.0)  # crop to 85-100% of length, pad to recover
-    p_time_warp: float = 0.7
+    crop_frac_range: tuple = (0.95, 1.0)
+    p_time_warp: float = 0.0
     p_noise: float = 0.7
     p_wander: float = 0.5
-    p_bandpass: float = 0.5
-    p_crop: float = 0.5
+    p_bandpass: float = 0.0
+    p_crop: float = 0.1
+
+    # Safety-veto default: keep morphology-changing transforms as ablations.
 
 
 # ---------------------------------------------------------------------------

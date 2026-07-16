@@ -98,8 +98,8 @@ def score_one(
 ) -> Dict:
     """Score one feature dict with the standard decision gate."""
     _nan = float("nan")
-    _empty = {"permit": False, "mahalanobis": _nan, "mahalanobis_threshold": _nan,
-              "max_zscore": _nan, "zscore_threshold": _nan,
+    _empty = {"permit": False, "mahalanobis": _nan, "knn": _nan, "primary_distance": _nan,
+              "mahalanobis_threshold": _nan, "max_zscore": _nan, "zscore_threshold": _nan,
               "signal_mahal_proxy": _nan, "rr_mahal_proxy": _nan,
               "hard_rule_violated": "",
               "top1_feature": "", "top1_zscore": _nan,
@@ -128,6 +128,8 @@ def score_one(
     return {
         "permit": bool(d["permit"]),
         "mahalanobis": float(d["mahalanobis"]),
+        "knn": float(d.get("knn", _nan)),
+        "primary_distance": float(d.get("primary_distance", d["mahalanobis"])),
         "mahalanobis_threshold": float(d["mahalanobis_threshold"]),
         "signal_mahal_proxy": float(d["signal_mahal_proxy"]),
         "rr_mahal_proxy": float(d["rr_mahal_proxy"]),
@@ -154,7 +156,8 @@ def score_one_hybrid(
     """Score one feature dict with the hybrid reliability-aware gate."""
     _nan = float("nan")
     _empty = {
-        "permit": False, "mahalanobis": _nan, "mahalanobis_threshold": _nan,
+        "permit": False, "mahalanobis": _nan, "knn": _nan, "primary_distance": _nan,
+        "mahalanobis_threshold": _nan,
         "signal_mahal_proxy": _nan, "rr_mahal_proxy": _nan,
         "max_zscore": _nan, "zscore_threshold": _nan,
         "hard_rule_violated": "",
@@ -198,6 +201,8 @@ def score_one_hybrid(
     return {
         "permit": bool(d["permit"]),
         "mahalanobis": float(d["mahalanobis"]),
+        "knn": float(d.get("knn", _nan)),
+        "primary_distance": float(d.get("primary_distance", d["mahalanobis"])),
         "mahalanobis_threshold": float(d["mahalanobis_threshold"]),
         "signal_mahal_proxy": float(d["signal_mahal_proxy"]),
         "rr_mahal_proxy": float(d["rr_mahal_proxy"]),
@@ -244,6 +249,11 @@ def _fit_calibrator(
     feature_set: str = "all",
     zscore_quantile: float = FROZEN_ZSCORE_QUANTILE,
     coupling_threshold: float = FROZEN_COUPLING_THRESHOLD,
+    threshold_method: str = "conformal",
+    conformal_alpha: float = 0.10,
+    calibration_outlier_frac: float = 0.0,
+    anomaly_model: str = "mahalanobis",
+    knn_k: int = 5,
 ) -> BaselineCalibrator:
     """Fit a calibrator on a list of healthy feature dicts."""
     hard_rules = {k: list(v) for k, v in DEFAULT_HARD_RULES.items()}
@@ -259,4 +269,9 @@ def _fit_calibrator(
         use_default_hard_rules=(feature_set == "all"),
         hard_rules=hard_rules if feature_set == "all" else None,
         feature_set=feature_set,
+        threshold_method=threshold_method,
+        conformal_alpha=conformal_alpha,
+        calibration_outlier_frac=calibration_outlier_frac,
+        anomaly_model=anomaly_model,
+        knn_k=knn_k,
     )

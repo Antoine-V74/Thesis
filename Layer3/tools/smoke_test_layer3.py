@@ -4,10 +4,10 @@ End-to-end smoke test for the Layer 3 validation pipeline.
 
 Generates synthetic WFDB records into a temporary directory and runs the
 full pipeline:
-    1. build_window_index.py
-    2. layer3_pretrain.py    (2 epochs, tiny batch)
-    3. layer3_validate.py    (window-level)
-    4. layer3_validate_beat_sync.py
+    1. tools/build_window_index.py
+    2. tools/pretrain_encoder.py    (2 epochs, tiny batch)
+    3. validation/run_window_validation.py
+    4. validation/run_beat_validation.py
     5. compare_layer2_layer3.py (against a synthetic Layer 2 per-beat CSV)
 
 Asserts that the expected output files exist. Does NOT validate metric
@@ -30,6 +30,8 @@ import numpy as np
 import pandas as pd
 
 THIS_DIR = Path(__file__).resolve().parent
+LAYER3_ROOT = THIS_DIR.parent
+VALIDATION_DIR = LAYER3_ROOT / "validation"
 PYTHON = sys.executable
 
 
@@ -143,7 +145,13 @@ def assert_exists(path: Path, what: str) -> None:
 def make_fake_layer2_per_beat(layer3_per_beat_csv: Path, out_csv: Path) -> None:
     """Build a synthetic Layer 2 per-beat CSV that shares merge keys with Layer 3."""
     l3 = pd.read_csv(layer3_per_beat_csv)
-    keep = [c for c in ["dataset", "record", "beat_sample", "beat_symbol", "is_healthy_beat"] if c in l3.columns]
+    keep = [
+        c for c in [
+            "dataset", "record", "beat_sample", "beat_symbol",
+            "safety_group", "safety_expectation", "is_healthy_beat",
+        ]
+        if c in l3.columns
+    ]
     l2 = l3[keep].copy()
     # Simple Layer 2 policy: permit if healthy beat, inhibit otherwise.
     if "is_healthy_beat" in l2.columns:
@@ -180,9 +188,9 @@ def main() -> None:
             "--data-dir", str(data_dir),
             "--datasets", "mitdb",
             "--out-csv", str(windows_csv),
-            "--window-s", "5",
+            "--window-s", "8",
             "--stride-s", "2",
-            "--target-fs", "250",
+            "--target-fs", "125",
         ])
         assert_exists(windows_csv, "windows index CSV")
         df = pd.read_csv(windows_csv)
@@ -191,24 +199,25 @@ def main() -> None:
             assert col in df.columns, f"missing pretrain column: {col}"
         print(f"  ok: {len(df)} windows, {df['record_id'].nunique()} records")
 
-        # 3. layer3_pretrain.py (very short)
+        # 3. pretrain_encoder.py (very short)
         run([
-            PYTHON, str(THIS_DIR / "layer3_pretrain.py"),
+            PYTHON, str(THIS_DIR / "pretrain_encoder.py"),
             "--window-index", str(windows_csv),
             "--epochs", "2",
             "--batch-size", "8",
             "--checkpoint-dir", str(pretrain_dir),
             "--num-workers", "0",
             "--seed", "0",
+            "--ssl-objective", "ntxent",
         ])
         last_ckpt = pretrain_dir / "encoder_last.pt"
         assert_exists(last_ckpt, "pretrain last checkpoint")
         assert_exists(pretrain_dir / "pretrain_history.csv", "pretrain history CSV")
 
-        # 4. layer3_validate.py (window-level)
+        # 4. run_window_validation.py (window-level)
         window_out = results_dir / "window_level"
         run([
-            PYTHON, str(THIS_DIR / "layer3_validate.py"),
+            PYTHON, str(VALIDATION_DIR / "run_window_validation.py"),
             "--data-dir", str(data_dir),
             "--datasets", "mitdb",
             "--window-index", str(windows_csv),
@@ -216,31 +225,77 @@ def main() -> None:
             "--out-dir", str(window_out),
             "--per-record-calibration",
             "--seed", "0",
-            "--guard-s", "5",
+            "--guard-s", "8",
             "--min-fit-windows", "4",
             "--min-val-windows", "2",
         ])
         for fname in ["per_window.csv", "metrics_overall.csv", "metrics_by_record.csv",
-                       "thresholds.csv", "FINAL_LAYER3_SUMMARY.md"]:
+                       "thresholds.csv", "threshold_coverage.csv", "FINAL_LAYER3_SUMMARY.md"]:
             assert_exists(window_out / fname, f"window-level output {fname}")
 
-        # 5. layer3_validate_beat_sync.py
+        # 5. run_beat_validation.py
         bs_out = results_dir / "beat_sync"
         run([
-            PYTHON, str(THIS_DIR / "layer3_validate_beat_sync.py"),
+            PYTHON, str(VALIDATION_DIR / "run_beat_validation.py"),
             "--data-dir", str(data_dir),
             "--datasets", "mitdb",
             "--checkpoint", str(last_ckpt),
             "--out-dir", str(bs_out),
             "--per-record-calibration",
             "--seed", "0",
-            "--guard-s", "5",
+            "--guard-s", "8",
             "--min-fit-beats", "10",
             "--min-val-beats", "5",
+            "--phase1-eval",
+            "--phase1-scorers", "mahalanobis,knn",
+            "--conformal-alpha", "0.20",
         ])
         for fname in ["per_beat.csv", "metrics_overall.csv", "metrics_by_record.csv",
-                       "thresholds.csv", "FINAL_LAYER3_SUMMARY.md"]:
+                       "thresholds.csv", "threshold_coverage.csv", "FINAL_LAYER3_SUMMARY.md"]:
             assert_exists(bs_out / fname, f"beat-sync output {fname}")
+        for fname in ["phase1_per_beat.csv", "phase1_thresholds.csv",
+                      "phase1_offline_operating_points.csv",
+                      "phase1_metrics_by_dataset.csv", "phase1_metrics_overall.csv",
+                      "phase1_aurocs.csv"]:
+            assert_exists(bs_out / fname, f"Phase 1 output {fname}")
+        phase1_cols = pd.read_csv(bs_out / "phase1_per_beat.csv", nrows=1).columns
+        for col in ["arm", "scorer", "threshold_method", "threshold", "decision", "conformal_alpha_infeasible"]:
+            assert col in phase1_cols, f"missing Phase 1 column: {col}"
+        phase1 = pd.read_csv(bs_out / "phase1_per_beat.csv", usecols=["threshold_method"])
+        assert "danger_2pct_offline" in set(phase1["threshold_method"].astype(str)), "missing offline danger operating point"
+
+        if os.environ.get("LAYER3_SMOKE_MAE"):
+            mae_dir = tmp / "Results" / "layer3_pretrain_mae"
+            run([
+                PYTHON, str(THIS_DIR / "pretrain_encoder.py"),
+                "--window-index", str(windows_csv),
+                "--epochs", "1",
+                "--batch-size", "8",
+                "--checkpoint-dir", str(mae_dir),
+                "--num-workers", "0",
+                "--seed", "0",
+                "--ssl-objective", "mae_subject_contrastive",
+                "--mask-ratio", "0.75",
+                "--subject-contrastive-lambda", "0.3",
+                "--max-windows", "24",
+            ])
+            assert_exists(mae_dir / "encoder_last.pt", "MAE+subject contrastive checkpoint")
+
+        if os.environ.get("LAYER3_SMOKE_VICREG"):
+            vicreg_dir = tmp / "Results" / "layer3_pretrain_vicreg"
+            run([
+                PYTHON, str(THIS_DIR / "pretrain_encoder.py"),
+                "--window-index", str(windows_csv),
+                "--epochs", "1",
+                "--batch-size", "8",
+                "--checkpoint-dir", str(vicreg_dir),
+                "--num-workers", "0",
+                "--seed", "0",
+                "--ssl-objective", "vicreg",
+                "--vicreg-expander-dims", "64,64",
+                "--max-windows", "24",
+            ])
+            assert_exists(vicreg_dir / "encoder_last.pt", "VICReg (A1) checkpoint")
 
         # 6. compare_layer2_layer3.py (with a synthetic Layer 2 CSV)
         fake_l2_csv = layer2_dir / "per_beat.csv"
@@ -253,7 +308,8 @@ def main() -> None:
             "--out-dir", str(compare_out),
         ])
         for fname in ["combined_per_beat.csv", "comparison_layer2_layer3.csv",
-                       "final_comparison_table.csv", "FINAL_COMPARISON_SUMMARY.md"]:
+                       "final_comparison_table.csv", "FINAL_COMPARISON_SUMMARY.md",
+                       "phase1_conditional_layer2.csv"]:
             assert_exists(compare_out / fname, f"comparison output {fname}")
 
         print("\n[SMOKE TEST PASSED]\n")

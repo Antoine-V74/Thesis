@@ -110,6 +110,7 @@ def resolve_torch_device(device: Optional[str] = "auto", require_cuda: bool = Fa
 # Conservative default for a stimulation safety gate: only normal sinus beat labels are
 # considered baseline-safe unless the user explicitly broadens the set.
 DEFAULT_NORMAL_SYMBOLS = {"N"}
+DEFAULT_DANGEROUS_SYMBOLS = {"V", "F", "E", "/", "f", "!"}
 KNOWN_BEAT_SYMBOLS = {
     "N", "L", "R", "B", "A", "a", "J", "S", "V", "r", "F", "e", "j", "n", "E", "/", "f", "Q", "?", "!"
 }
@@ -128,6 +129,33 @@ def parse_csv_list(value: str | Sequence[str]) -> List[str]:
     for item in value:
         out.extend(parse_csv_list(item))
     return out
+
+
+def load_record_allowlist(path: str | Path) -> set[Tuple[str, str]]:
+    """
+    Load (dataset, record) pairs from a CSV with columns dataset, record.
+
+    Used to restrict beat validation to gold transition records
+    (e.g. Results/layer3/transition_analysis/pilot_primary_mitbih_gold.csv).
+    """
+    import pandas as pd
+
+    csv_path = Path(path)
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Record allowlist not found: {csv_path}")
+    df = pd.read_csv(csv_path)
+    cols = {c.lower(): c for c in df.columns}
+    if "dataset" not in cols or "record" not in cols:
+        raise ValueError(
+            f"Record allowlist must have columns 'dataset' and 'record' (got {list(df.columns)})"
+        )
+    pairs: set[Tuple[str, str]] = set()
+    for _, row in df.iterrows():
+        ds = str(row[cols["dataset"]]).strip()
+        rec = str(row[cols["record"]]).strip().replace("\\", "/")
+        if ds and rec and ds.lower() != "nan" and rec.lower() != "nan":
+            pairs.add((ds, rec))
+    return pairs
 
 
 def import_wfdb():
@@ -460,6 +488,217 @@ def add_auroc_auprc(metrics: Dict[str, Any], y_abnormal: np.ndarray, scores: np.
         metrics["auroc_abnormal_score"] = np.nan
         metrics["auprc_abnormal_score"] = np.nan
     return metrics
+
+
+def wilson_ci(successes: int, total: int, z: float = 1.959963984540054) -> Tuple[float, float]:
+    """Wilson score interval for a binomial rate."""
+    total = int(total)
+    successes = int(successes)
+    if total <= 0:
+        return float("nan"), float("nan")
+    p = successes / total
+    denom = 1.0 + (z * z) / total
+    center = (p + (z * z) / (2.0 * total)) / denom
+    margin = (
+        z
+        * math.sqrt((p * (1.0 - p) / total) + (z * z) / (4.0 * total * total))
+        / denom
+    )
+    return float(max(0.0, center - margin)), float(min(1.0, center + margin))
+
+
+def conformal_threshold_from_scores(scores: np.ndarray, alpha: float) -> Dict[str, Any]:
+    """Upper-tail split-conformal threshold for healthy calibration scores.
+
+    The finite-sample guarantee is only for healthy false alarms / false inhibits
+    under exchangeability. It is not a false-permit guarantee on dangerous beats.
+    If alpha is infeasible for the calibration sample size, callers should
+    fail-safe inhibit instead of silently relaxing alpha.
+    """
+    s = np.asarray(scores, dtype=float)
+    s = np.sort(s[np.isfinite(s)])
+    n = int(len(s))
+    alpha = float(alpha)
+    if n <= 0:
+        return {
+            "threshold": float("nan"),
+            "status": "no_healthy_calibration_scores",
+            "alpha": alpha,
+            "n": n,
+            "rank": 0,
+            "alpha_min": float("nan"),
+        }
+    if not (0.0 < alpha < 1.0):
+        return {
+            "threshold": float("nan"),
+            "status": "invalid_alpha",
+            "alpha": alpha,
+            "n": n,
+            "rank": 0,
+            "alpha_min": float(1.0 / (n + 1)),
+        }
+    rank = int(math.ceil((n + 1) * (1.0 - alpha)))
+    alpha_min = float(1.0 / (n + 1))
+    if rank > n:
+        return {
+            "threshold": float("nan"),
+            "status": "alpha_infeasible",
+            "alpha": alpha,
+            "n": n,
+            "rank": rank,
+            "alpha_min": alpha_min,
+        }
+    return {
+        "threshold": float(s[rank - 1]),
+        "status": "ok",
+        "alpha": alpha,
+        "n": n,
+        "rank": rank,
+        "alpha_min": alpha_min,
+    }
+
+
+def select_decision_threshold(
+    val_scores: np.ndarray,
+    method: str,
+    threshold_quantile: float,
+    conformal_alpha: float,
+) -> Dict[str, Any]:
+    """Choose a healthy-only decision threshold for the main permit/inhibit gate.
+
+    Two methods are supported:
+
+    - ``conformal``: split-conformal upper-tail threshold with a stated healthy
+      false-inhibit budget ``alpha`` (distribution-free, exchangeability only).
+    - ``healthy_quantile``: the historical ``quantile(healthy_val_scores, q)``.
+
+    The returned ``target_false_inhibit`` is ``alpha`` for conformal and
+    ``1 - quantile`` for the quantile method, so a coverage report can compare
+    the achieved healthy false-inhibit rate against a single stated target.
+
+    Callers MUST fail-safe inhibit when ``status != "ok"`` (uncertainty ->
+    inhibit). This helper never relaxes ``alpha`` silently.
+    """
+    method = str(method).lower()
+    s = np.asarray(val_scores, dtype=float)
+    s = s[np.isfinite(s)]
+    n = int(s.size)
+    if method == "conformal":
+        info = conformal_threshold_from_scores(s, float(conformal_alpha))
+        return {
+            "threshold": float(info["threshold"]),
+            "method": "conformal",
+            "status": str(info["status"]),
+            "target_false_inhibit": float(conformal_alpha),
+            "conformal_alpha": float(conformal_alpha),
+            "conformal_alpha_min": float(info.get("alpha_min", float("nan"))),
+            "n_val": n,
+        }
+    if method == "healthy_quantile":
+        if n <= 0:
+            return {
+                "threshold": float("nan"),
+                "method": "healthy_quantile",
+                "status": "no_healthy_calibration_scores",
+                "target_false_inhibit": float(1.0 - float(threshold_quantile)),
+                "conformal_alpha": float("nan"),
+                "conformal_alpha_min": float("nan"),
+                "n_val": n,
+            }
+        q = float(np.clip(threshold_quantile, 0.0, 1.0))
+        return {
+            "threshold": float(np.quantile(s, q)),
+            "method": "healthy_quantile",
+            "status": "ok",
+            "target_false_inhibit": float(1.0 - q),
+            "conformal_alpha": float("nan"),
+            "conformal_alpha_min": float("nan"),
+            "n_val": n,
+        }
+    raise ValueError(f"Unsupported threshold method: {method!r} (use conformal or healthy_quantile)")
+
+
+def write_threshold_coverage(
+    scored: pd.DataFrame,
+    out_dir: Path,
+    *,
+    threshold_method: str,
+    target_false_inhibit: float,
+    healthy_col: str,
+    record_col: str = "record_key",
+) -> pd.DataFrame:
+    """Write ``threshold_coverage.csv``: achieved vs targeted healthy false-inhibit.
+
+    Only scored test rows with a genuine ``permit``/``inhibit`` decision on
+    healthy beats/windows are counted. ``within_target`` is a per-group
+    diagnostic; conformal coverage holds in expectation over calibration draws,
+    not necessarily for every record, so small-``n`` records may exceed target.
+    """
+    df = scored.copy()
+    if healthy_col not in df.columns:
+        raise KeyError(f"healthy column {healthy_col!r} missing from scored frame")
+    mask = (
+        (df["split"] == "test")
+        & df["decision"].isin(["permit", "inhibit"])
+        & df[healthy_col].astype(bool)
+    )
+    eval_df = df[mask]
+
+    def _row(name: str, gg: pd.DataFrame) -> Dict[str, Any]:
+        n = int(len(gg))
+        fi = int((gg["decision"].astype(str).str.lower() == "inhibit").sum())
+        rate = float(fi / n) if n else float("nan")
+        lo, hi = wilson_ci(fi, n)
+        return {
+            record_col: name,
+            "threshold_method": str(threshold_method),
+            "target_false_inhibit": float(target_false_inhibit),
+            "n_healthy_test": n,
+            "false_inhibit_healthy_n": fi,
+            "achieved_false_inhibit_healthy": rate,
+            "achieved_false_inhibit_ci_low": lo,
+            "achieved_false_inhibit_ci_high": hi,
+            "within_target": bool(rate <= target_false_inhibit) if n else False,
+        }
+
+    rows = [_row(str(rk), gg) for rk, gg in eval_df.groupby(record_col)]
+    coverage = pd.DataFrame(rows)
+    overall = _row("ALL", eval_df)
+    coverage = pd.concat([coverage, pd.DataFrame([overall])], ignore_index=True)
+    coverage.to_csv(out_dir / "threshold_coverage.csv", index=False)
+    return coverage
+
+
+def phase1_label_group(symbol: Any, normal_symbols: Iterable[str], dangerous_symbols: Iterable[str]) -> str:
+    """Map a beat symbol to Phase 1 reporting groups without changing policy."""
+    sym = str(symbol)
+    normal = {str(s) for s in normal_symbols}
+    dangerous = {str(s) for s in dangerous_symbols}
+    if sym in normal:
+        return "NORMAL"
+    if sym in dangerous:
+        return "DANGEROUS"
+    if sym in NON_BEAT_SYMBOLS:
+        return "NOISE"
+    if sym in KNOWN_BEAT_SYMBOLS:
+        return "BENIGN_ABNORMAL"
+    return "UNLABELED"
+
+
+def safe_auroc(y_positive: np.ndarray, scores: np.ndarray) -> float:
+    """Return AUROC for a positive class scored by larger anomaly scores."""
+    try:
+        from sklearn.metrics import roc_auc_score
+        y = np.asarray(y_positive).astype(int)
+        s = np.asarray(scores, dtype=float)
+        mask = np.isfinite(s)
+        y = y[mask]
+        s = s[mask]
+        if len(np.unique(y)) != 2:
+            return float("nan")
+        return float(roc_auc_score(y, s))
+    except Exception:
+        return float("nan")
 
 
 def write_json(path: str | Path, payload: Dict[str, Any]) -> None:

@@ -30,13 +30,15 @@ requirements.txt Python dependencies
 
 ## Main Components
 
-| Component | Purpose | Status |
-|---|---|---|
-| `Layer1/` | Low-latency R-peak timing and RR/rhythm supervision | active |
-| `Layer2/` | Handcrafted feature gate calibrated against a safe ECG baseline | active |
-| `RPeakDetection/` | Comparison of local and classical R-peak detectors | active |
-| `BayesOpt/` | Bayesian optimization of MNA/LV simulation parameters | active research |
-| `Layer3/` | Learned embedding/anomaly-detection experiments | exploratory |
+
+| Component         | Purpose                                                         | Status          |
+| ----------------- | --------------------------------------------------------------- | --------------- |
+| `Layer1/`         | Low-latency R-peak timing and RR/rhythm supervision             | active          |
+| `Layer2/`         | Handcrafted feature gate calibrated against a safe ECG baseline | active          |
+| `RPeakDetection/` | Comparison of local and classical R-peak detectors              | active          |
+| `BayesOpt/`       | Bayesian optimization of MNA/LV simulation parameters           | active research |
+| `Layer3/`         | Learned embedding/anomaly-detection experiments                 | exploratory     |
+
 
 ## Safety Logic
 
@@ -96,8 +98,10 @@ to avoid storing large generated files.
 
 More detailed documentation is available inside each module:
 
+- `reports/ECG_SAFETY_PIPELINE_ARCHITECTURE.md` — **Layers 1–3 overview with diagrams**
 - `Layer1/README.md`
 - `Layer2/README.md`
 - `RPeakDetection/README.md`
 - `BayesOpt/README.md`
 - `Safety_Supervision.md`
+

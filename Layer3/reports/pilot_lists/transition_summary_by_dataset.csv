@@ -1,0 +1,10 @@
+dataset,n_records,n_with_danger,total_danger_beats,total_danger_span_s,eligible_strict_ge30beats,eligible_relaxed_ge30beats,scoreable_danger_beats_strict_ge30,eligible_strict_ge100beats,eligible_relaxed_ge100beats,scoreable_danger_beats_strict_ge100,eligible_strict_ge300beats,eligible_relaxed_ge300beats,scoreable_danger_beats_strict_ge300,rhythmonly_eligible_strict_ge30s,rhythmonly_eligible_strict_ge60s,rhythmonly_eligible_strict_ge120s
+mit_bih_arrhythmia,48,20,1481,857.8527777777778,13,20,654,11,17,613,10,14,610,0,0,0
+normal_sinus_rhythm,16,0,0,0.0,0,0,0,0,0,0,0,0,0,0,0,0
+supraventricular_arrhythmia,78,0,0,0.0,0,0,0,0,0,0,0,0,0,0,0,0
+long_term_atrial_fibrillation,40,35,11140,6429.234375,28,35,5603,27,35,5578,24,32,5085,0,0,0
+noise_stress_test,12,0,0,0.0,0,0,0,0,0,0,0,0,0,0,0,0
+st_petersburg_12lead,75,0,0,0.0,0,0,0,0,0,0,0,0,0,0,0,0
+atrial_fibrillation,4,0,0,0.0,0,0,0,0,0,0,0,0,0,0,0,0
+malignant_ventricular_arrhythmia,22,22,0,11548.072,0,0,0,0,0,0,0,0,0,13,11,11
+creighton_vfib,35,34,108,4178.788,33,33,108,30,31,108,24,25,100,0,0,0
