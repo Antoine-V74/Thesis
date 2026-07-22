@@ -101,6 +101,7 @@ More detailed documentation is available inside each module:
 - `reports/ECG_SAFETY_PIPELINE_ARCHITECTURE.md` — **Layers 1–3 overview with diagrams**
 - `Layer1/README.md`
 - `Layer2/README.md`
+- `Layer3/README.md`
 - `RPeakDetection/README.md`
 - `BayesOpt/README.md`
 - `Safety_Supervision.md`
