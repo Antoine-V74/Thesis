@@ -113,6 +113,50 @@ different scales
 
 Pure NumPy / PyWavelets. No deep learning. Pynapse-compatible.
 
+#### Optional SQI ensemble (`compute_sqi_ensemble=True`) — artifact robustness
+
+No single SQI is robust to every artifact, so ICD/AED and clinical wearable
+practice combine complementary indices and inhibit if any one flags poor
+quality (Clifford et al. 2012; Behar et al. 2013; Li et al. 2008). Off by
+default so the frozen feature set / existing calibrations are unchanged; when
+enabled it adds three interpretable, causal, label-free indices:
+
+```text
+signal__ksqi  kurtosis of the window. Clean ECG is highly peaked (sharp QRS);
+              EMG / motion / saturation flattens it -> kurtosis drops.
+signal__psqi  QRS-band (5-15 Hz) power / 5-40 Hz power. High for clean ECG,
+              low when broadband noise or wander dominates.
+signal__bsqi  agreement of two independent R-peak detectors (Li et al. 2008).
+              Low agreement -> beat train (and every rr__ / morph__ feature)
+              is untrustworthy. Supplied by the caller (needs two detectors)
+              via full_features(..., bsqi=...).
+```
+
+Hard-rule limits live in `SQI_ENSEMBLE_HARD_RULES` (`decision/config.py`) and
+only fire when these keys are present, so they are inert until the ensemble is
+enabled. Enable the matching hard rules with
+`hard_rules_with_extensions(include_sqi_ensemble=True)`.
+
+#### SQI flip-on gate (do this before changing the frozen gate)
+
+**Current policy:** SQI ensemble is opt-in only. Do **not** put it in
+`DEFAULT_HARD_RULES` / default `decide()` until the checklist below passes.
+
+| Step | What | Pass criterion (human MIT-BIH first) |
+| ---- | ---- | ------------------------------------ |
+| 1 | Run `run_artifact_stress_test.py` on real WFDB windows | Clean false-inhibit ≤ ~0.05; each artifact class detection ≥ ~0.80 (stim, lead-off, EMG, wander, powerline, saturation) |
+| 2 | Decide if SQI is meaningful | If clean FI high **or** stim/lead-off detection weak → stop; do not wire into beat validation |
+| 3 | Recalibrate cutoffs on a held-out clean + artifact set | Sweep `ksqi` / `psqi` / `bsqi` limits; pick the most permissive set that still meets the Step-1 budgets. Write chosen limits into `SQI_ENSEMBLE_HARD_RULES` (or a species-specific override) |
+| 4 | Only then add CLI / gate wiring | `--sqi-ensemble` on `run_beat_validation.py`, then optional move into frozen `DEFAULT_HARD_RULES` after a full gold-cohort beat validation shows no unacceptable healthy FI rise |
+
+**Calibration note:** Step 3 is required. Literature defaults (kSQI≥4, pSQI≥0.40,
+bSQI≥0.80) are **shape checks only**, not deployable thresholds. Recalibrate on
+human first; rat/pig need their own cutoffs (different HR / QRS bandwidth).
+
+**Cluster order (agreed):** SQI stress test **first**. Full beat validation +
+Neyman–Pearson are downstream of a meaningful SQI result — do not block on them
+until Step 2 passes.
+
 ### Morphology features (`morphology_features.py`)
 
 Beat-centered features around the **trigger** R-peak (`focus_peak_s`):
@@ -155,6 +199,30 @@ Justification:
 - scalar RR stats work on 30 s look-back and are real-time compatible
 - spectral HRV needs long RR history (~50 s human LF); often disabled in
 beat-sync runtime (`compute_spectral_hrv=False`)
+
+#### Optional onset / stability discriminators (`compute_onset_stability=True`)
+
+Rate alone does not separate a dangerous organised VT from fast-conducted AF or
+sinus tachycardia. Implantable defibrillators solve this with two
+discriminators layered on top of rate-zone branching (Swerdlow et al. 1994;
+Medtronic "Onset" / Boston Scientific "Stability"). Off by default; when enabled
+it adds:
+
+```text
+rr__onset_accel_frac  fractional RR shortening first-half -> second-half of the
+                      window. Large positive = abrupt onset (VT-like); ~0 =
+                      gradual (sinus tachycardia-like).
+rr__stability_ms      mean |successive RR difference|. Low = regular / stable
+                      (monomorphic VT); high = irregular (AF).
+rr__tachy_fraction    fraction of RR at or above the species tachy rate.
+```
+
+Rate-zone helper `classify_rate_zone(hr_bpm, species)` returns one of
+`brady / normal / tachy / vt_zone / vf_zone` (species boundaries in
+`_SPECIES_CONFIGS`). It decides *when* the discriminators matter: they are
+informative in the tachy / VT zone, while a VF-rate is treated as dangerous
+regardless of stability. Reference limits are in `ONSET_STABILITY_REFERENCE_LIMITS`
+(placeholders; discriminators, not blanket vetoes).
 
 ---
 
@@ -483,6 +551,24 @@ candidate beat after its R-peak. Instead:
 5. after beat 8, the cadence state resets and a new 7-beat observation block starts
 ```
 
+This is an **X-of-Y persistence** detector — the same formalism used for
+arrhythmia onset confirmation in ICDs/AEDs (Medtronic NID, Boston Scientific
+duration/persistence; Swerdlow et al. 1994), but inverted for safety: instead
+of requiring X-of-Y fast intervals to CONFIRM danger and shock, we require
+X-of-Y SAFE observation beats to PERMIT stimulation, so uncertainty defaults to
+inhibit.
+
+```text
+Y = observation_beats            (window length)
+X = min_safe_observations        (required safe count)
++ optional most-recent-beat guard (require_last_observation_safe)
+```
+
+Build one directly with `ProspectiveCadenceGate.from_x_of_y(x_safe, y_observed)`.
+Persistence trades a little latency (cannot permit before Y beats) for strong
+rejection of single-beat artifacts and transient misdetections — the correct
+trade for an inhibit-only gate.
+
 Why this matters:
 
 - mechanical contraction follows the electrical R-peak too quickly to wait for
@@ -516,9 +602,14 @@ Not learned from data. Set by safety policy and benchmark tuning.
 | `FROZEN_ZSCORE_QUANTILE`    | max-zscore threshold quantile (0.90)               |
 | `RRReliabilityConfig`       | species-specific RR trust settings for hybrid mode |
 | `check_rr_reliability()`    | computes reliability flags for `decide_hybrid()`   |
+| `SQI_ENSEMBLE_HARD_RULES`   | opt-in kSQI/pSQI/bSQI limits (inert until enabled) |
+| `ONSET_STABILITY_REFERENCE_LIMITS` | opt-in onset/stability reference limits     |
+| `hard_rules_with_extensions()` | merge SQI-ensemble rules into DEFAULT_HARD_RULES |
 
 
 Do not change frozen thresholds without re-running cross-dataset benchmarks.
+The opt-in SQI-ensemble / onset-stability limits are literature-inspired
+placeholders and must be recalibrated per setup before any deployment claim.
 
 ---
 
@@ -540,6 +631,51 @@ Secondary: false inhibit rate (healthy state wrongly blocked).
 
 ---
 
+## Operating Point and Artifact Robustness
+
+Two offline audits sit on top of the runtime gate. Neither changes the
+label-free deployment path (conformal calibration on healthy baseline only);
+they quantify what that path costs and how it fails.
+
+### Neyman-Pearson operating point (`run_np_operating_point.py`)
+
+The deployable threshold is set label-free (conformal α on healthy windows).
+It does not, by itself, know how much danger leaks through. Using the danger
+labels that exist in public datasets, this script selects the operating point
+that:
+
+```text
+minimise   normal false-inhibit rate       (Type II — therapy uptime)
+subject to danger false-permit rate <= budget   (Type I — the safety metric)
+```
+
+This is the classical Neyman-Pearson test: bound the dangerous error, then be
+as permissive as possible under that bound (Scott & Nowak 2005). It is a
+**design / reporting** tool, not a runtime calibrator — animal deployment has
+no danger labels, so the chosen α must be transferred and this script measures
+the danger-leakage cost of that choice on labeled data. It also emits a
+**per-record worst-case danger false-permit** table: judge Layer 2 by the worst
+record, not the pooled mean.
+
+Outputs: `np_frontier.csv`, `np_operating_point.csv`, `worst_record_danger.csv`.
+
+### Artifact / lead-off stress test (`run_artifact_stress_test.py`)
+
+Deployment adds artifact classes public benchmarks under-represent:
+stimulation pulse trains, lead-off flatline, saturation/clipping, powerline
+pickup, EMG bursts, baseline wander. A false permit during any of these is a
+safety failure. This script injects each artifact into clean windows and
+checks the SQI gate (kSQI + pSQI + FFT ratios, plus bSQI on real data)
+inhibits, reporting a per-artifact detection rate and the clean false-inhibit
+rate. Prefers real WFDB windows; falls back to a synthetic surrogate (smoke
+only — bSQI is disabled on the surrogate because two detectors disagree even on
+clean synthetic signal).
+
+Outputs: `artifact_detection_summary.csv`, `artifact_per_window.csv`,
+`artifact_clean_baseline.csv`.
+
+---
+
 ## Validation, Tools, and Reports
 
 Layer 2 has two support areas beyond `pipeline/`:
@@ -555,6 +691,8 @@ Layer 2 has two support areas beyond `pipeline/`:
 | `run_beat_validation.py`          | beat-sync and 1-in-8 cadence modes                              | Deployment-like benchmark             |
 | `run_cross_dataset_validation.py` | MIT-BIH, NSTDB, SVDB, INCART, CUDB, VFDB                        | Generalization study                  |
 | `run_pareto_sweep.py`             | unified Pareto entry point: quick / full / posthoc              | Operating-point search                |
+| `run_np_operating_point.py`       | Neyman-Pearson operating point + worst-record danger leak       | Offline label-aware operating point   |
+| `run_artifact_stress_test.py`     | inject stim/lead-off/EMG/wander artifacts, check SQI inhibits   | Artifact-robustness audit             |
 | `run_causal_lookahead_sweep.py`   | sweep post-R lookahead ms                                       | Causal delay budget study             |
 | `common.py`                       | shared helpers (filtering, scoring, calibrator fit)             | imported by validation scripts        |
 | `layer2_validation_utils.py`      | conformal threshold, guard region, policy metrics, coverage CSV | imported by beat validation           |

@@ -49,34 +49,34 @@ ECG → ECGEncoder1D → 128-d embedding → Mahalanobis/kNN → threshold → p
 ## Slide 5 — Beat-synchronous evaluation
 
 - One beat → one decision
-- 1 s window @ 125 Hz
+- Primary window: 8 s @ 125 Hz (rhythm + morphology)
+- Morphology ablation: 1 s window (secondary)
 - Causal + optional post-R lookahead (50–150 ms)
 - Oracle vs Layer 1 gated modes
 
 ---
 
-## Slide 6 — SSL pretraining
+## Slide 6 — Encoder pretraining (SSL + supervised)
 
-- Physiology-aware augmentations
-- Training heads discarded at deploy
-- Healthy-only SSL ablation available
-- Human pretrain → per-session baseline re-fit
+- SSL arms (A/A1/B/B1): unlabeled ECG + physiology-aware augmentations
+- Arm C: supervised contrastive using public labels **at pretrain only**
+- All training heads discarded → deploy is label-free one-class
+- Human pretrain → frozen encoder → per-session healthy baseline re-fit
 
 ---
 
 ## Slide 7 — Phase 1 arms
 
+| Arm | Method |
+|-----|--------|
+| A0 | Layer 2 handcrafted (control) |
+| A | NT-Xent contrastive |
+| A1 | VICReg non-contrastive |
+| B | MAE + same-window consistency (primary masked) |
+| B1 | MAE + subject-contrastive (ablation) |
+| C | Supervised contrastive (SupCon) — labels pretrain-only |
 
-| Arm | Method                        |
-| --- | ----------------------------- |
-| A0  | Layer 2 handcrafted (control) |
-| A   | NT-Xent contrastive           |
-| A1  | VICReg non-contrastive        |
-| B   | MAE + subject-contrastive     |
-| C   | Multi-lead (appendix)         |
-
-
-Fixed downstream scorer isolates encoder quality.
+Fixed downstream scorer isolates encoder quality. Multi-lead = future appendix, not Arm C.
 
 ---
 
@@ -99,9 +99,11 @@ Fixed downstream scorer isolates encoder quality.
 
 ## Slide 10 — Status
 
-- Full pipeline implemented (encoder, scorer, validation, A/A1/B SSL)
-- Conformal threshold default
-- Smoke test available
+- Full pipeline implemented (encoder, scorer, validation, conformal threshold)
+- SSL arms A / A1 / B / B1 implemented
+- Arm C (SupCon supervised) implemented — labels pretrain-only, encoder-only checkpoint
+- Exploratory 8 s runs: SSL not yet clearly beating A0 → motivates Arm C + locked pilot
+- Smoke test covers index build, pretrain (incl. supcon), validation
 
 ---
 
@@ -115,8 +117,9 @@ Fixed downstream scorer isolates encoder quality.
 
 ## Slide 12 — Next steps
 
-- Cluster A0/A/A1/B comparison
-- Phase 1 safety tables with CIs
+- Locked gold pilot: A0 / A / A1 / B (+B1 ablation) on MIT-BIH gold
+- Add Arm C (SupCon): does using labels at pretrain help the representation?
+- Phase 1 safety tables: false-permit + record-bootstrap CIs; CAV vs A0
 - Rat baseline when data available
 
 ---
@@ -132,4 +135,4 @@ Fixed downstream scorer isolates encoder quality.
 
 ---
 
-*See also: `ALGORITHM_SUMMARY.md`, `LAYER3_ARCHITECTURE_RATIONALE.md`, `VICREG_A1_IMPLEMENTATION_PLAN.md`*
+*See also: `reports/README.md`, `ALGORITHM_SUMMARY.md`, `LAYER3_ARCHITECTURE_RATIONALE.md`*

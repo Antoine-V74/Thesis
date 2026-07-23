@@ -23,10 +23,16 @@ Optional upstream step before deployment:
 ```text
 unlabeled ECG windows (8 s @ 125 Hz)
   -> physiology-aware augmentations
-  -> SSL pretraining (NT-Xent / VICReg / masked+subject)
+  -> SSL pretraining, one of the arms:
+       A  = ntxent            (NT-Xent / SimCLR contrastive)
+       A1 = vicreg            (non-contrastive)
+       B  = mae_consistency   (masked recon + non-contrastive same-window consistency) [primary]
+       B1 = mae_subject_contrastive (masked recon + subject contrastive) [ablation]
   -> shared ECGEncoder1D weights
   -> per-session healthy Mahalanobis/kNN (ZEROSHOT-style)
 ```
+
+Arm definitions and per-arm pretraining-data policy: `reports/LAYER3_ARM_B_B1_SPEC.md`.
 
 Layer 2 and Layer 3 remain independent; final permit is AND across layers.
 Project therapy cadence (1-in-8 observe/stimulate) applies to the whole stack.
@@ -94,7 +100,9 @@ Implementation: `pipeline/layer3_encoder.py`
 `ECGEncoder1D` is a small 1D residual CNN:
 
 ```text
-input:  (B, 1, T)     default T = 5 s @ 250 Hz = 1250 samples
+input:  (B, 1, T)     primary protocol T = 8 s @ 125 Hz = 1000 samples
+                      (the encoder is length-agnostic; older examples used
+                       5 s @ 250 Hz — 8 s @ 125 Hz is the frozen protocol)
 stem:   Conv1d 1 -> 32
 stages: 4 downsample stages, 2 ResBlocks each
 pool:   global average pool
@@ -121,10 +129,12 @@ Validation utilities (`validation/layer3_validation_utils.py`) apply:
 
 ```text
 robust median/MAD normalization per window
-optional resampling to target_fs (default 250 Hz)
+optional resampling to target_fs (protocol default 125 Hz)
 ```
 
-Each window is passed to the encoder as `(1, T)`.
+The SSL pretraining loop (`tools/pretrain_encoder.py`) uses the **same** robust
+median/MAD normalization, so the encoder sees a consistent input distribution at
+train and eval time. Each window is passed to the encoder as `(1, T)`.
 
 ---
 
@@ -519,36 +529,49 @@ a research extension that may run offline or on an external server
 
 ## Quick Command Reference
 
-Build a window index:
+> **Protocol note.** The canonical, up-to-date command sequence lives in
+> `reports/ZEROSHOT_CLUSTER_RUN_NOTES.md` (§0b = MIT-BIH pilot). The frozen
+> protocol is **8 s @ 125 Hz**, dataset id `mit_bih_arrhythmia`. The snippets
+> below are illustrative and match that protocol; if they ever disagree with the
+> cluster notes, the cluster notes win.
+
+Build a window index (8 s / 125 Hz):
 
 ```powershell
 python Layer3\tools\build_window_index.py `
   --data-dir data `
-  --datasets mitdb `
-  --out-csv Results\layer3\index\windows.csv
+  --datasets mit_bih_arrhythmia `
+  --out-csv Results\layer3\window_index\layer3_windows_mitbih_8s_125hz.csv `
+  --window-s 8 --stride-s 2 --target-fs 125 --lead-index 0
 ```
 
-Optional SSL pretraining:
+Optional SSL pretraining (A / NT-Xent shown):
 
 ```powershell
 python Layer3\tools\pretrain_encoder.py `
-  --window-index Results\layer3\index\windows.csv `
+  --window-index Results\layer3\window_index\layer3_windows_mitbih_8s_125hz.csv `
+  --ssl-objective ntxent --augment-fs 125 `
   --epochs 100 `
-  --checkpoint-dir Results\layer3\checkpoints
+  --checkpoint-dir Results\layer3\pretrain\ntxent_mitbih_seed0
 ```
 
-Beat-sync validation (main benchmark):
+Beat-sync validation (main benchmark, primary window = 8 s):
 
 ```powershell
 python Layer3\validation\run_beat_validation.py `
   --data-dir data `
-  --datasets mitdb `
-  --checkpoint Results\layer3\checkpoints\encoder_last.pt `
+  --datasets mit_bih_arrhythmia `
+  --records-csv Layer3\reports\pilot_lists\pilot_primary_mitbih_gold.csv `
+  --checkpoint Results\layer3\pretrain\ntxent_mitbih_seed0\encoder_last.pt `
   --out-dir Results\layer3\beat_validation `
   --mode oracle `
-  --window-s 1.0 `
-  --causal-window `
-  --lookahead-ms 100
+  --window-s 8 --target-fs 125 `
+  --causal-window --lookahead-ms 100 `
+  --per-record-calibration --guard-s 8 `
+  --l2-normalize-embeddings --pca-dim 32 `
+  --phase1-eval --phase1-arms a0,layer3 --phase1-scorers mahalanobis,knn `
+  --threshold-method conformal --conformal-alpha 0.10 `
+  --no-random-fallback
 ```
 
 Window-level validation:
@@ -556,9 +579,9 @@ Window-level validation:
 ```powershell
 python Layer3\validation\run_window_validation.py `
   --data-dir data `
-  --datasets mitdb `
-  --window-index Results\layer3\index\windows.csv `
-  --checkpoint Results\layer3\checkpoints\encoder_last.pt `
+  --datasets mit_bih_arrhythmia `
+  --window-index Results\layer3\window_index\layer3_windows_mitbih_8s_125hz.csv `
+  --checkpoint Results\layer3\pretrain\ntxent_mitbih_seed0\encoder_last.pt `
   --out-dir Results\layer3\window_validation `
   --anomaly-model mahalanobis
 ```

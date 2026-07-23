@@ -38,6 +38,17 @@ DEFAULT_MAHAL_EXCLUDE = [
     "signal__hf_noise_ratio",
     "signal__lf_wander_ratio",
     "signal__raw_hf_noise_ratio",
+    # Opt-in SQI ensemble and onset/stability discriminators are handled as
+    # hard rules (see below), so they are excluded from Mahalanobis. These
+    # entries are inert until the matching features are actually computed
+    # (compute_sqi_ensemble / compute_onset_stability), because fit() drops
+    # exclude names that are absent from the feature vector.
+    "signal__ksqi",
+    "signal__psqi",
+    "signal__bsqi",
+    "rr__onset_accel_frac",
+    "rr__stability_ms",
+    "rr__tachy_fraction",
 ]
 
 NON_DROPPABLE_HARD_RULES = frozenset({
@@ -61,6 +72,60 @@ DEFAULT_HARD_RULES: Dict[str, List[Optional[float]]] = {
 FEATURE_SET_CHOICES = ("all", "signal_only", "hybrid_rewarming")
 
 FROZEN_ZSCORE_QUANTILE: float = 0.90
+
+
+# ---------------------------------------------------------------------------
+# Opt-in artifact / discriminator hard rules (NOT part of the frozen gate)
+# ---------------------------------------------------------------------------
+#
+# These rules only fire when the matching opt-in features are computed
+# (compute_sqi_ensemble / compute_onset_stability). They are provided as a
+# separate dict so the frozen DEFAULT_HARD_RULES above stays byte-for-byte
+# unchanged and existing benchmarks are unaffected. To use them, merge into the
+# calibrator's hard rules via hard_rules_with_extensions() and calibrate with
+# the ensemble features present.
+#
+# IMPORTANT: the numeric limits below are LITERATURE-INSPIRED PLACEHOLDERS
+# (Clifford et al. 2012; Li et al. 2008; ICD Onset/Stability defaults). They
+# MUST be recalibrated on the target setup (human dev-set first, then rat/pig)
+# before any deployment claim. Direction is [lo, hi]: inhibit if value < lo or
+# value > hi.
+
+# SQI ensemble: inhibit on poor signal quality (mirrors an AED "noisy ECG,
+# analysis suspended" state).
+SQI_ENSEMBLE_HARD_RULES: Dict[str, List[Optional[float]]] = {
+    "signal__ksqi": [4.0, None],   # low kurtosis -> flat / noisy, not ECG-like
+    "signal__psqi": [0.40, None],  # too little QRS-band power -> broadband noise
+    "signal__bsqi": [0.80, None],  # two detectors disagree -> untrustworthy beats
+}
+
+# Onset & stability: these are DISCRIMINATORS, not standalone vetoes, so they
+# are intentionally NOT expressed as blanket hard rules. Rate-zone branching
+# (below) decides when they matter. Kept here as documented reference limits
+# for the analysis scripts and future decision wiring.
+ONSET_STABILITY_REFERENCE_LIMITS: Dict[str, List[Optional[float]]] = {
+    # In the VT rate zone, a sudden onset (large positive accel) plus a stable
+    # (low ms) fast rhythm is the classic monomorphic-VT signature.
+    "rr__onset_accel_frac": [None, 0.20],  # >0.20 fractional acceleration = abrupt
+    "rr__stability_ms": [None, 50.0],      # <50 ms successive diff = organised/stable
+}
+
+
+def hard_rules_with_extensions(
+    include_sqi_ensemble: bool = False,
+) -> Dict[str, List[Optional[float]]]:
+    """
+    Return DEFAULT_HARD_RULES optionally extended with the opt-in SQI ensemble.
+
+    Pass the result as ``hard_rules=`` to BaselineCalibrator.fit() when
+    calibrating with the SQI ensemble features present. The frozen
+    DEFAULT_HARD_RULES dict itself is never mutated.
+    """
+    rules: Dict[str, List[Optional[float]]] = {k: list(v) for k, v in DEFAULT_HARD_RULES.items()}
+    if include_sqi_ensemble:
+        for k, v in SQI_ENSEMBLE_HARD_RULES.items():
+            rules[k] = list(v)
+    return rules
 
 
 @dataclass

@@ -179,9 +179,36 @@ Auteur AB, Auteur CD, Auteur EF. Titre complet de l’article. Nom de la revue. 
 
 - **Thesis protocol (T0–T4).** Calibrate on T2 (stable HF pre-stimulation), not T0 or population norms.
 
-### 8e. Signal quality hard gate
+### 8e. Signal quality hard gate (SQI ensemble)
+
+No single SQI is robust to every artifact, so we combine complementary indices
+and inhibit if any one flags poor quality (implemented as the opt-in
+`compute_sqi_ensemble` path: kSQI, pSQI, bSQI + FFT hf/lf ratios).
 
 - **Clifford et al., 2012** — *J Electrocardiol*. SQIs; inhibit before anomaly scoring.
+- **Behar et al., 2013** — *IEEE TBME*. ECG SQI ensemble for false-alarm reduction; motivates combining multiple complementary indices rather than one.
+- **Li et al., 2008** — *Physiological Measurement*. bSQI: agreement between two independent QRS detectors as a robust signal-quality index; used here to flag untrustworthy beat trains before rr__/morph__ features.
+
+### 8f. Onset & stability rate discriminators (ICD/AED lineage)
+
+Decades of implantable-defibrillator engineering already discriminate dangerous
+organised VT from SVT/AF at the same rate using rate-zone branching plus onset
+and stability criteria — a handful of interpretable features. Layer 2 adopts
+the same discriminators (opt-in `compute_onset_stability`: onset_accel_frac,
+stability_ms, tachy_fraction; `classify_rate_zone`).
+
+- **Swerdlow et al., 1994** — *Circulation*. Onset and stability SVT/VT discriminators for implantable defibrillators; interpretable rate-based safety logic.
+- **Task Force, 1996** — *Circulation*. HRV standards underpinning the RR variability features reused as stability (also §8a).
+
+### 8g. Operating point and persistence (Neyman-Pearson + X-of-Y)
+
+The runtime threshold is fit label-free on the healthy baseline; the operating
+point and its danger-leakage cost are audited offline against a
+Neyman-Pearson bound, and the 1-in-8 cadence is formalised as an inverted
+ICD-style X-of-Y persistence rule.
+
+- **Scott & Nowak, 2005** — *IEEE Trans. Information Theory*. Neyman-Pearson classification: bound the (dangerous) Type-I error, minimise the other; frames the false-permit-budgeted operating point.
+- **Swerdlow et al., 1994** — *Circulation*. Sustained-rate / duration (X-of-Y) detection criteria; the safety gate inverts this to require persistent SAFE beats before permitting (also §8f).
 
 ---
 
@@ -236,6 +263,10 @@ Auteur AB, Auteur CD, Auteur EF. Titre complet de l’article. Nom de la revue. 
 | Paper                       | Section      | Why                                |
 | --------------------------- | ------------ | ---------------------------------- |
 | **Clifford et al., 2012**   | §8e          | SQI — déjà suggéré                 |
+| **Behar et al., 2013**      | §8e          | Ensemble SQI (kSQI/pSQI ensemble)  |
+| **Li et al., 2008**         | §8e          | bSQI two-detector agreement        |
+| **Swerdlow et al., 1994**   | §8f          | ICD onset/stability discriminators |
+| **Scott & Nowak, 2005**     | §8g          | Neyman-Pearson operating point     |
 | **Richman & Moorman, 2000** | §8b          | Entropie — dans Safety_Supervision |
 | **Hannun et al., 2019**     | §6b          | Si tu retires une des deux reviews |
 | **Li et al., 2026**         | §6c          | Si pas déjà dans ton Word          |

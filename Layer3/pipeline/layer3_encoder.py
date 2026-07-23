@@ -82,6 +82,8 @@ class EncoderConfig:
     embedding_dim: int = 128
     kernel: int = 7
     groups: int = 8              # GroupNorm group count
+    pooling_mode: str = "global_avg"  # locked default; exploratory: avg_max, causal_local_global
+    local_fraction: float = 0.125     # final-map tail used by causal_local_global
 
 
 class ECGEncoder1D(nn.Module):
@@ -116,7 +118,15 @@ class ECGEncoder1D(nn.Module):
         self.stages = nn.Sequential(*stages)
 
         self.final_gn = nn.GroupNorm(min(cfg.groups, ch), ch)
-        self.head_linear = nn.Linear(ch, cfg.embedding_dim)
+        pooling_mode = str(cfg.pooling_mode).lower()
+        if pooling_mode not in {"global_avg", "avg_max", "causal_local_global"}:
+            raise ValueError(
+                f"Unsupported pooling_mode={cfg.pooling_mode!r}; "
+                "use global_avg, avg_max, or causal_local_global"
+            )
+        self.pooling_mode = pooling_mode
+        pooled_channels = ch if pooling_mode == "global_avg" else 2 * ch
+        self.head_linear = nn.Linear(pooled_channels, cfg.embedding_dim)
         self.out_channels = ch
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -127,8 +137,22 @@ class ECGEncoder1D(nn.Module):
         h = self.stem(x)
         h = self.stages(h)
         h = F.relu(self.final_gn(h))
-        h = F.adaptive_avg_pool1d(h, 1).squeeze(-1)   # (B, ch)
-        z = self.head_linear(h)
+        global_avg = F.adaptive_avg_pool1d(h, 1).squeeze(-1)
+        if self.pooling_mode == "global_avg":
+            pooled = global_avg
+        elif self.pooling_mode == "avg_max":
+            # Max pooling preserves short high-response morphology that global
+            # averaging can dilute across an 8 s rhythm window.
+            global_max = F.adaptive_max_pool1d(h, 1).squeeze(-1)
+            pooled = torch.cat([global_avg, global_max], dim=1)
+        else:
+            # Beat-synchronous causal windows place the current trigger near the
+            # right edge. Pair full-window rhythm context with a local tail pool.
+            fraction = float(min(1.0, max(1e-3, self.cfg.local_fraction)))
+            local_n = max(1, int(round(h.shape[-1] * fraction)))
+            local_avg = h[..., -local_n:].mean(dim=-1)
+            pooled = torch.cat([global_avg, local_avg], dim=1)
+        z = self.head_linear(pooled)
         return z
 
 

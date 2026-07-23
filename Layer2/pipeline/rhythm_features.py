@@ -46,6 +46,10 @@ _SPECIES_CONFIGS: Dict[str, Dict] = {
         "resample_hz": 4.0,            # RR interpolation grid rate
         "min_rr_ms": 250.0,            # hard physiological floor (~240 bpm)
         "max_rr_ms": 2500.0,           # hard physiological ceiling (~24 bpm)
+        # Rate-zone boundaries (bpm) for ICD/AED-style branching (see below).
+        "tachy_bpm": 100.0,            # above normal sinus rest
+        "vt_bpm": 180.0,               # ventricular-tachycardia zone entry
+        "vf_bpm": 250.0,               # fibrillation-rate zone entry
     },
     "rat": {
         "short_rr_thresh_ms": 100.0,   # < 100 ms = short (HR > 600 bpm)
@@ -55,6 +59,9 @@ _SPECIES_CONFIGS: Dict[str, Dict] = {
         "resample_hz": 20.0,           # higher rate for faster rhythm
         "min_rr_ms": 80.0,             # ~750 bpm floor
         "max_rr_ms": 500.0,            # ~120 bpm ceiling
+        "tachy_bpm": 500.0,
+        "vt_bpm": 600.0,
+        "vf_bpm": 750.0,
     },
     "pig": {
         "short_rr_thresh_ms": 350.0,
@@ -64,8 +71,44 @@ _SPECIES_CONFIGS: Dict[str, Dict] = {
         "resample_hz": 4.0,
         "min_rr_ms": 300.0,
         "max_rr_ms": 1500.0,
+        "tachy_bpm": 120.0,
+        "vt_bpm": 180.0,
+        "vf_bpm": 250.0,
     },
 }
+
+# Ordered rate zones, slowest to fastest. Used by classify_rate_zone().
+RATE_ZONES = ("brady", "normal", "tachy", "vt_zone", "vf_zone")
+
+
+def classify_rate_zone(hr_bpm: float, species: str = "human") -> str:
+    """
+    Map an instantaneous heart rate to an ICD/AED-style rate zone.
+
+    Rate-zone branching is the first discriminator in every implantable
+    defibrillator: the aggressiveness of the safety response scales with rate.
+    Layer 2 uses the zone to decide whether the onset and stability
+    discriminators are even relevant (they only matter in the tachy / VT zone;
+    a VF-rate is treated as dangerous regardless of stability).
+
+    Returns one of RATE_ZONES. NaN / non-finite HR returns "brady" (fail-safe:
+    a rate we cannot read is treated as the least-permissive slow state, and
+    the caller's reliability / hard-rule logic handles the missing data).
+    """
+    cfg = get_species_config(species)
+    if not np.isfinite(hr_bpm) or hr_bpm <= 0:
+        return "brady"
+    if hr_bpm >= cfg["vf_bpm"]:
+        return "vf_zone"
+    if hr_bpm >= cfg["vt_bpm"]:
+        return "vt_zone"
+    if hr_bpm >= cfg["tachy_bpm"]:
+        return "tachy"
+    # Below tachy: split normal vs brady at the long-RR (slow) boundary.
+    brady_bpm = 60_000.0 / cfg["long_rr_thresh_ms"]
+    if hr_bpm < brady_bpm:
+        return "brady"
+    return "normal"
 
 
 def get_species_config(species: str) -> Dict:
@@ -174,6 +217,84 @@ def _spectral_hrv(
 
 
 # ---------------------------------------------------------------------------
+# Onset & stability discriminators (ICD/AED-style)
+# ---------------------------------------------------------------------------
+
+_ONSET_STABILITY_FEATURE_NAMES = (
+    "onset_accel_frac",
+    "stability_ms",
+    "tachy_fraction",
+)
+
+
+def _nan_onset_stability() -> Dict[str, float]:
+    return {k: float("nan") for k in _ONSET_STABILITY_FEATURE_NAMES}
+
+
+def onset_stability_features(rr: np.ndarray, tachy_bpm: float) -> Dict[str, float]:
+    """
+    Onset and stability discriminators computed from an RR series (ms).
+
+    These mirror the two classic implantable-defibrillator SVT/VT
+    discriminators (Swerdlow et al. 1994; Boston Scientific / Medtronic
+    "Onset" and "Stability" algorithms):
+
+    onset_accel_frac
+        Fractional shortening of RR from the first half of the window to the
+        second half: (median_first - median_second) / median_first, clipped to
+        [-1, 1]. A large positive value means the rate accelerated abruptly
+        within the window (sudden onset -> VT-like); values near 0 mean a
+        gradual or steady rate (sinus tachycardia-like).
+
+    stability_ms
+        Mean absolute successive RR difference (ms). Low = regular / stable
+        fast rhythm (monomorphic VT); high = irregular (AF conducted fast).
+        Stability is what separates a dangerous organised VT from irregular AF
+        at the same mean rate.
+
+    tachy_fraction
+        Fraction of RR intervals at or above the species tachy rate
+        (rr <= 60000 / tachy_bpm). How much of the window is actually fast.
+
+    Returns NaN for features that need >=2 intervals when fewer are available.
+    """
+    rr = np.asarray(rr, dtype=float).ravel()
+    n = len(rr)
+    if n == 0:
+        return _nan_onset_stability()
+
+    # tachy_fraction is defined for any n >= 1.
+    tachy_rr_ms = 60_000.0 / tachy_bpm if tachy_bpm > 0 else float("nan")
+    tachy_fraction = (
+        float(np.mean(rr <= tachy_rr_ms)) if np.isfinite(tachy_rr_ms) else float("nan")
+    )
+
+    if n < 2:
+        return {
+            "onset_accel_frac": float("nan"),
+            "stability_ms": float("nan"),
+            "tachy_fraction": tachy_fraction,
+        }
+
+    stability_ms = float(np.mean(np.abs(np.diff(rr))))
+
+    half = n // 2
+    if half >= 1 and (n - half) >= 1:
+        med_first = float(np.median(rr[:half]))
+        med_second = float(np.median(rr[half:]))
+        onset = (med_first - med_second) / med_first if med_first > 1e-9 else float("nan")
+        onset_accel_frac = float(np.clip(onset, -1.0, 1.0)) if np.isfinite(onset) else float("nan")
+    else:
+        onset_accel_frac = float("nan")
+
+    return {
+        "onset_accel_frac": onset_accel_frac,
+        "stability_ms": stability_ms,
+        "tachy_fraction": tachy_fraction,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main feature function
 # ---------------------------------------------------------------------------
 
@@ -185,6 +306,7 @@ def rhythm_features(
     long_rr_thresh_ms: Optional[float] = None,
     compute_spectral: bool = True,
     min_rr_for_spectral: int = 10,
+    compute_onset_stability: bool = False,
 ) -> Dict[str, float]:
     """
     Compute RR-interval and rhythm features from R-peak timestamps or RR intervals.
@@ -286,6 +408,10 @@ def rhythm_features(
         "short_rr_fraction":   short_frac,
         "long_rr_fraction":    long_frac,
     }
+
+    # ---- Onset / stability discriminators (opt-in) --------------------------
+    if compute_onset_stability:
+        features.update(onset_stability_features(rr, tachy_bpm=cfg["tachy_bpm"]))
 
     # ---- Spectral HRV -------------------------------------------------------
     if not compute_spectral or n < min_rr_for_spectral:

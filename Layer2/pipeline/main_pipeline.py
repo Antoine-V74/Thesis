@@ -40,6 +40,9 @@ def extract_layer2_features(
     compute_spectral_hrv: bool = True,
     compute_entropy: bool = True,
     focus_peak_s: Optional[float] = None,
+    compute_sqi_ensemble: bool = False,
+    bsqi: Optional[float] = None,
+    compute_onset_stability: bool = False,
 ) -> Tuple[FeatureDict, Dict[str, str]]:
     """Compute the full Layer 2 feature vector for one ECG window."""
     return full_features(
@@ -50,6 +53,9 @@ def extract_layer2_features(
         compute_spectral_hrv=compute_spectral_hrv,
         compute_entropy=compute_entropy,
         focus_peak_s=focus_peak_s,
+        compute_sqi_ensemble=compute_sqi_ensemble,
+        bsqi=bsqi,
+        compute_onset_stability=compute_onset_stability,
     )
 
 
@@ -92,6 +98,9 @@ def decide_layer2(
     compute_spectral_hrv: bool = True,
     compute_entropy: bool = True,
     focus_peak_s: Optional[float] = None,
+    compute_sqi_ensemble: bool = False,
+    bsqi: Optional[float] = None,
+    compute_onset_stability: bool = False,
 ) -> Tuple[DecisionDict, FeatureDict]:
     """
     Run the Layer 2 safety decision for one window.
@@ -106,6 +115,9 @@ def decide_layer2(
         compute_spectral_hrv=compute_spectral_hrv,
         compute_entropy=compute_entropy,
         focus_peak_s=focus_peak_s,
+        compute_sqi_ensemble=compute_sqi_ensemble,
+        bsqi=bsqi,
+        compute_onset_stability=compute_onset_stability,
     )
     decision = calibrator.decide(features)
     return decision, features

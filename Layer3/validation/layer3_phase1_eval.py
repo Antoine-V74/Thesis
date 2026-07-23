@@ -146,12 +146,14 @@ def _score_phase1_matrix(
         knn_k=args.knn_k,
         calibration_outlier_frac=args.calibration_outlier_frac,
         min_keep=args.min_fit_beats,
+        covariance_estimator=args.covariance_estimator,
     )
     scores = baseline.score(x)
     meta = {
         "n_fit_after_pruning": int(getattr(baseline, "n_fit_", len(fit_pos))),
         "n_outlier_removed": int(getattr(baseline, "n_outlier_removed_", 0)),
         "knn_k": int(args.knn_k) if scorer == "knn" else np.nan,
+        "covariance_estimator": str(args.covariance_estimator) if scorer == "mahalanobis" else "",
     }
     meta.update({f"preprocess_{k}": v for k, v in preprocess_meta.items()})
     return scores.astype(float), meta
@@ -626,12 +628,261 @@ def _add_phase1_offline_danger_operating_point(
     return out, pd.DataFrame(op_rows)
 
 
+# ---------------------------------------------------------------------------
+# Danger-type stratification (Step 0.5 taxonomy)
+# ---------------------------------------------------------------------------
+
+# Datasets whose DANGEROUS content is a rhythm span (VT/VF/flutter), not an
+# isolated morphology beat. See LAYER3_PHASE1_PREREGISTRATION.md §3.
+_RHYTHM_SPAN_DATASETS = {
+    "creighton_vfib",
+    "malignant_ventricular_arrhythmia",
+    "cudb",
+    "vfdb",
+    "long_term_atrial_fibrillation",
+    "atrial_fibrillation",
+}
+
+
+def danger_subtype(row: pd.Series) -> str:
+    """Map a DANGEROUS beat to a coarse origin pool (rhythm / morphology / noise).
+
+    Documented mapping (prereg §3, "do not invent morphology labels"):
+      - NOISE safety group                         -> danger_noise
+      - rhythm-span datasets (VF/VT/AF episodes)   -> danger_rhythm
+      - ventricular flutter wave symbol '!'        -> danger_rhythm
+      - isolated ventricular ectopy V/E/F/f        -> danger_morphology
+      - everything else                            -> danger_other
+    """
+    if str(row.get("safety_group", "")) == NOISE:
+        return "danger_noise"
+    dataset = str(row.get("dataset", ""))
+    symbol = str(row.get("beat_symbol", ""))
+    if dataset in _RHYTHM_SPAN_DATASETS:
+        return "danger_rhythm"
+    if symbol == "!":
+        return "danger_rhythm"
+    if symbol in {"V", "E", "F", "f"}:
+        return "danger_morphology"
+    return "danger_other"
+
+
+def _false_permit_stratified(eval_df: pd.DataFrame) -> pd.DataFrame:
+    """False-permit rate on DANGEROUS beats, split by danger subtype pool."""
+    danger = eval_df[eval_df["phase1_label_group"].astype(str).eq(DANGEROUS)].copy()
+    if danger.empty:
+        return pd.DataFrame()
+    danger["danger_subtype"] = danger.apply(danger_subtype, axis=1)
+    permit = danger["decision"].astype(str).str.lower().eq("permit")
+    rows: List[Dict[str, object]] = []
+    group_cols = ["arm", "scorer", "threshold_method", "danger_subtype"]
+    for keys, gg in danger.groupby(group_cols, dropna=False):
+        gg_permit = permit.loc[gg.index]
+        fp = int(gg_permit.sum())
+        n = int(len(gg))
+        lo, hi = wilson_ci(fp, n)
+        rows.append({
+            "arm": keys[0],
+            "scorer": keys[1],
+            "threshold_method": keys[2],
+            "danger_subtype": keys[3],
+            "n_DANGEROUS": n,
+            "n_records": int(gg["record_key"].nunique()),
+            "false_permit_n": fp,
+            "false_permit": float(fp / n) if n else float("nan"),
+            "false_permit_ci_low": lo,
+            "false_permit_ci_high": hi,
+        })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Record-cluster bootstrap CI (headline uncertainty)
+# ---------------------------------------------------------------------------
+
+def _record_cluster_bootstrap(
+    eval_df: pd.DataFrame,
+    *,
+    n_boot: int = 2000,
+    seed: int = 12345,
+) -> pd.DataFrame:
+    """Record-cluster bootstrap 95% CI for pooled false-permit on DANGEROUS beats.
+
+    Resamples *records* (not beats) with replacement so the CI reflects the small
+    number of independent recordings, not the correlated per-beat count. This is
+    the pre-registered headline uncertainty; Wilson beat CIs are transparency only.
+    """
+    danger = eval_df[eval_df["phase1_label_group"].astype(str).eq(DANGEROUS)].copy()
+    if danger.empty:
+        return pd.DataFrame()
+    danger["permit"] = danger["decision"].astype(str).str.lower().eq("permit")
+    rows: List[Dict[str, object]] = []
+    for keys, gg in danger.groupby(["arm", "scorer", "threshold_method"], dropna=False):
+        per_rec = gg.groupby("record_key")["permit"].agg(["sum", "count"])
+        fp = per_rec["sum"].to_numpy(dtype=float)
+        n = per_rec["count"].to_numpy(dtype=float)
+        n_rec = int(len(per_rec))
+        total_n = float(n.sum())
+        point = float(fp.sum() / total_n) if total_n > 0 else float("nan")
+        per_record_rate = np.divide(fp, n, out=np.full_like(fp, np.nan), where=n > 0)
+        if n_rec >= 2 and total_n > 0:
+            rng = np.random.default_rng(seed)
+            idx = rng.integers(0, n_rec, size=(int(n_boot), n_rec))
+            num = fp[idx].sum(axis=1)
+            den = n[idx].sum(axis=1)
+            boot = np.divide(num, den, out=np.full(int(n_boot), np.nan), where=den > 0)
+            lo, hi = np.nanpercentile(boot, [2.5, 97.5])
+        else:
+            lo = hi = float("nan")
+        rows.append({
+            "arm": keys[0],
+            "scorer": keys[1],
+            "threshold_method": keys[2],
+            "n_records": n_rec,
+            "n_DANGEROUS": int(total_n),
+            "false_permit_DANGEROUS": point,
+            "boot_ci_low": float(lo),
+            "boot_ci_high": float(hi),
+            "per_record_false_permit_mean": float(np.nanmean(per_record_rate)) if n_rec else float("nan"),
+            "per_record_false_permit_median": float(np.nanmedian(per_record_rate)) if n_rec else float("nan"),
+            "n_boot": int(n_boot),
+            "ci_method": "record_cluster_bootstrap",
+        })
+    return pd.DataFrame(rows)
+
+
+def _false_permit_by_record(eval_df: pd.DataFrame) -> pd.DataFrame:
+    """Per-record false-permit on DANGEROUS beats (for per-record inspection)."""
+    danger = eval_df[eval_df["phase1_label_group"].astype(str).eq(DANGEROUS)].copy()
+    if danger.empty:
+        return pd.DataFrame()
+    danger["permit"] = danger["decision"].astype(str).str.lower().eq("permit")
+    rows: List[Dict[str, object]] = []
+    for keys, gg in danger.groupby(["arm", "scorer", "threshold_method", "record_key"], dropna=False):
+        fp = int(gg["permit"].sum())
+        n = int(len(gg))
+        rows.append({
+            "arm": keys[0],
+            "scorer": keys[1],
+            "threshold_method": keys[2],
+            "record_key": keys[3],
+            "n_DANGEROUS": n,
+            "false_permit_n": fp,
+            "false_permit_DANGEROUS": float(fp / n) if n else float("nan"),
+        })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Conditional added value (A0 vs Layer 3) — the L2 ⊥ L3 question
+# ---------------------------------------------------------------------------
+
+def _compute_cav_l2_l3(eval_df: pd.DataFrame) -> pd.DataFrame:
+    """A0 ↔ Layer 3 conditional added value + score correlation on shared beats.
+
+    Requires both the 'a0_layer2_features' and 'layer3' arms in eval_df. Joins the
+    two arms on the same beat (beat_id) within each (scorer, threshold_method) and
+    reports, per prereg §4: healthy score correlation, inhibit agreement on
+    DANGEROUS, CAV (L3 catches an A0 false permit), the symmetric quantity,
+    redundancy ratio, and the healthy therapy-availability cost.
+    """
+    arms = set(eval_df["arm"].astype(str).unique())
+    if not ({"a0_layer2_features", "layer3"} <= arms):
+        return pd.DataFrame()
+    cols = ["beat_id", "scorer", "threshold_method", "phase1_label_group",
+            "decision", "anomaly_score", "record_key"]
+    base = eval_df[[c for c in cols if c in eval_df.columns]].copy()
+    a0 = base[eval_df["arm"].astype(str).eq("a0_layer2_features")]
+    l3 = base[eval_df["arm"].astype(str).eq("layer3")]
+    merged = a0.merge(
+        l3,
+        on=["beat_id", "scorer", "threshold_method"],
+        suffixes=("_a0", "_l3"),
+        how="inner",
+    )
+    if merged.empty:
+        return pd.DataFrame()
+
+    rows: List[Dict[str, object]] = []
+    for keys, gg in merged.groupby(["scorer", "threshold_method"], dropna=False):
+        label = gg["phase1_label_group_a0"].astype(str)
+        permit_a0 = gg["decision_a0"].astype(str).str.lower().eq("permit")
+        permit_l3 = gg["decision_l3"].astype(str).str.lower().eq("permit")
+
+        normal = label.eq(NORMAL)
+        healthy = gg[normal]
+        finite = (
+            np.isfinite(pd.to_numeric(healthy["anomaly_score_a0"], errors="coerce"))
+            & np.isfinite(pd.to_numeric(healthy["anomaly_score_l3"], errors="coerce"))
+        )
+        hv = healthy[finite]
+        if len(hv) >= 3:
+            sa = pd.to_numeric(hv["anomaly_score_a0"], errors="coerce")
+            sl = pd.to_numeric(hv["anomaly_score_l3"], errors="coerce")
+            r_pearson = float(sa.corr(sl, method="pearson"))
+            # Spearman = Pearson of ranks (avoids an optional scipy dependency).
+            r_spearman = float(sa.rank().corr(sl.rank(), method="pearson"))
+        else:
+            r_pearson = r_spearman = float("nan")
+
+        danger = label.eq(DANGEROUS)
+        pa = permit_a0[danger].to_numpy()
+        pl = permit_l3[danger].to_numpy()
+        n_danger = int(danger.sum())
+        both_permit = int(np.sum(pa & pl))
+        both_inhibit = int(np.sum(~pa & ~pl))
+        only_a0_permit = int(np.sum(pa & ~pl))   # L3 uniquely inhibits (good)
+        only_l3_permit = int(np.sum(~pa & pl))   # A0 uniquely inhibits
+        n_a0_permit_danger = int(np.sum(pa))
+        n_l3_permit_danger = int(np.sum(pl))
+        cav = float(only_a0_permit / n_a0_permit_danger) if n_a0_permit_danger else float("nan")
+        cav_symmetric = float(only_l3_permit / n_l3_permit_danger) if n_l3_permit_danger else float("nan")
+        a0_fp = float(np.mean(pa)) if n_danger else float("nan")
+        l3_fp = float(np.mean(pl)) if n_danger else float("nan")
+        joint_fp = float(np.mean(pa & pl)) if n_danger else float("nan")
+        denom = a0_fp * l3_fp
+        redundancy_ratio = float(joint_fp / denom) if denom and np.isfinite(denom) and denom > 0 else float("nan")
+
+        normal_a0_permit = permit_a0[normal].to_numpy()
+        normal_l3_permit = permit_l3[normal].to_numpy()
+        n_normal_a0_permit = int(np.sum(normal_a0_permit))
+        healthy_extra_inhibit = (
+            float(np.sum(normal_a0_permit & ~normal_l3_permit) / n_normal_a0_permit)
+            if n_normal_a0_permit else float("nan")
+        )
+
+        rows.append({
+            "scorer": keys[0],
+            "threshold_method": keys[1],
+            "n_shared_beats": int(len(gg)),
+            "n_DANGEROUS": n_danger,
+            "n_NORMAL": int(normal.sum()),
+            "r_healthy_pearson": r_pearson,
+            "r_healthy_spearman": r_spearman,
+            "danger_both_permit_n": both_permit,
+            "danger_both_inhibit_n": both_inhibit,
+            "danger_only_L3_inhibits_n": only_a0_permit,
+            "danger_only_A0_inhibits_n": only_l3_permit,
+            "A0_false_permit_DANGEROUS": a0_fp,
+            "L3_false_permit_DANGEROUS": l3_fp,
+            "joint_false_permit_DANGEROUS": joint_fp,
+            "redundancy_ratio_vs_independent": redundancy_ratio,
+            "CAV_L3_catches_A0_false_permit": cav,
+            "CAV_symmetric_A0_catches_L3": cav_symmetric,
+            "healthy_extra_inhibit_cost": healthy_extra_inhibit,
+            "note": "CAV>~0.15 useful complementarity; <~0.05 near-redundant (heuristic).",
+        })
+    return pd.DataFrame(rows)
+
+
 def write_phase1_outputs(
     scored: pd.DataFrame,
     thresholds: pd.DataFrame,
     out_dir: Path,
     *,
     offline_danger_fpr_target: float = 0.02,
+    bootstrap_n: int = 2000,
+    bootstrap_seed: int = 12345,
 ) -> None:
     scored, offline_ops = _add_phase1_offline_danger_operating_point(
         scored,
@@ -668,4 +919,25 @@ def write_phase1_outputs(
         out_dir / "phase1_aurocs.csv",
         index=False,
     )
+
+    # Headline uncertainty: record-cluster bootstrap (beats within a record are
+    # correlated, so Wilson beat CIs above are transparency only).
+    _record_cluster_bootstrap(
+        eval_df, n_boot=int(bootstrap_n), seed=int(bootstrap_seed)
+    ).to_csv(out_dir / "phase1_metrics_bootstrap.csv", index=False)
+
+    # Per-record false permit (inspect danger-mass concentration).
+    _false_permit_by_record(eval_df).to_csv(
+        out_dir / "phase1_metrics_by_record.csv", index=False
+    )
+
+    # Danger-type stratified false permit (rhythm vs morphology vs noise).
+    _false_permit_stratified(eval_df).to_csv(
+        out_dir / "phase1_metrics_by_danger_subtype.csv", index=False
+    )
+
+    # A0 ↔ Layer 3 conditional added value / correlation (the L2 ⊥ L3 question).
+    cav = _compute_cav_l2_l3(eval_df)
+    if not cav.empty:
+        cav.to_csv(out_dir / "phase1_cav_l2_l3.csv", index=False)
 

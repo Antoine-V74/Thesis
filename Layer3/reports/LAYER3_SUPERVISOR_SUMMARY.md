@@ -27,7 +27,7 @@ uncertainty / server failure → inhibit
 flowchart TB
   subgraph Offline["Offline optional"]
     U[Unlabeled ECG PhysioNet] --> AUG[Physiology-aware augmentations]
-    AUG --> SSL[SSL pretraining A / A1 / B]
+    AUG --> SSL[SSL A / A1 / B / B1 · supervised C]
     SSL --> W[Frozen ECGEncoder1D]
   end
 
@@ -54,7 +54,7 @@ flowchart TB
 | Cadence                | Project **1-in-8** (observe 7, stim opportunity on 8) | Therapy policy for whole stack, not Layer-3-specific      |
 
 
-**Honest limitation:** PhysioNet pretrain and Phase 1 eval may **overlap at record level**. Do not claim “unseen patient” unless records are held out of pretrain.
+**Honest limitation:** PhysioNet pretrain and Phase 1 eval can **overlap at record level** if not controlled. For the primary pilot, hold out the MIT-BIH gold eval records during SSL pretraining using `--exclude-records-csv`; otherwise label the result exploratory.
 
 ---
 
@@ -68,11 +68,14 @@ All arms share the same healthy-baseline Mahalanobis/kNN + conformal scorer so w
 | **A0** | Layer 2 **features only** + **same** Mahalanobis/kNN/conformal | Representation control — **not** the full Layer 2 hard-rule gate      |
 | **A**  | NT-Xent / SimCLR-style (CLOCS-inspired)                        | Standard contrastive SSL baseline                                     |
 | **A1** | VICReg non-contrastive                                         | Negative-free; may condition embeddings better for covariance scoring |
-| **B**  | Masked recon + subject-contrastive (ZEROSHOT-inspired)         | Closest literature template: SSL → personalized Mahalanobis           |
-| **C**  | Multi-lead upper bound                                         | Appendix only if time                                                 |
+| **B**  | Masked recon + non-contrastive same-window consistency         | Learns ECG structure without pulling all same-record windows together |
+| **B1** | Masked recon + subject/record contrastive                      | ZEROSHOT-style ablation; preferably healthy-only                      |
+| **C**  | **Supervised contrastive (SupCon)** — public labels **at pretrain only** | Tests whether labels shape a better representation; deploy stays label-free (same scorer) |
 
 
-Dual-scale (1 s + 8 s concat) = **future improvement**, not required before first cluster campaign.
+Every arm — including supervised **C** — feeds the **same** label-free personalized Mahalanobis/kNN + conformal scorer, so differences reflect the representation only. Deployment never sees a danger label.
+
+Multi-lead upper bound and dual-scale (1 s + 8 s concat) = **future appendix items**, not Arm C and not required before the first cluster campaign.
 
 ---
 
@@ -107,7 +110,11 @@ Public human ECG = **proxy validation** for Layer 3 (human research scope).
 
 | Done                                                                                                                              | Next (gate first)                                                                                     |
 | --------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Encoder, SSL arms A / A1 / B, Mahalanobis/kNN, beat-sync validation, conformal default, smoke test, `count_transition_records.py` | **Step 0:** freeze n_DANGEROUS / transitions → then pilot → full A0/A/A1/B at **8 s** only if powered |
+| Encoder, SSL arms A / A1 / B / B1, **supervised Arm C (SupCon)**, Mahalanobis/kNN, beat-sync validation, conformal default, record bootstrap, smoke test (incl. supcon) | **Step 0:** freeze n_DANGEROUS / transitions → locked gold pilot A0/A/A1/B (+B1) at **8 s** → add Arm C only if powered |
+
+**Honest exploratory status:** on early 8 s runs under the fixed scorer, the SSL arms have **not clearly beaten the A0 handcrafted control** on false-permit. This is why (a) A0 stays the reported control floor and (b) Arm C was added — to test whether using the labels we already have at *pretraining* buys a better representation than pure SSL. Headline numbers await the locked MIT-BIH gold pilot on the cluster.
+
+**Layer 3 stop criterion (decided 23 Jul 2026):** run **Arm C (SupCon)** as the supervised ceiling, plus **at most one** AD-native ladder rung if already implemented; report **all** arms (false-permit + CAV) with a **pre-committed confirmation cohort** — 9 arms on 13 records is a multiple-comparisons setting, so no single-cohort "winner" is a claim. If nothing beats A0 or adds CAV, **bank the negative and stop L3**, moving effort to the L2 operating point, causal runtime path, rat/pig calibration config, and stimulation-artefact robustness. (Detail: `LAYER3_CONSOLIDATED_SUMMARY.md` §8c.)
 
 
 ---
@@ -118,6 +125,8 @@ Public human ECG = **proxy validation** for Layer 3 (human research scope).
 | Topic                                                     | File                                |
 | --------------------------------------------------------- | ----------------------------------- |
 | **Medium consolidated summary (papers, gold, ablations)** | `LAYER3_CONSOLIDATED_SUMMARY.md`    |
+| **Reports map (start here)**                              | `README.md`                         |
+| Arm A / B(+B1) / C complete status + specs              | `LAYER3_COMPLETE_STATUS_A.md`, `LAYER3_COMPLETE_STATUS_B.md`, `LAYER3_COMPLETE_STATUS_C.md` (+ short specs `LAYER3_ARM_B_B1_SPEC.md`, `LAYER3_ARM_C_SUPERVISED_SPEC.md`) |
 | Critical review brief (AI / external)                     | `LAYER3_SCIENTIFIC_REVIEW_BRIEF.md` |
 | Algorithm detail                                          | `../ALGORITHM_SUMMARY.md`           |
 | Design rationale                                          | `LAYER3_ARCHITECTURE_RATIONALE.md`  |

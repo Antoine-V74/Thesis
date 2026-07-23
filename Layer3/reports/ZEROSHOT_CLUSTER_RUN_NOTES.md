@@ -1,7 +1,8 @@
 # Layer 3 — Cluster Run Notes (pretrain + Phase 1 eval)
 
-Reproducible command sequence for **A0 / A / A1 / B** arms.  
+Reproducible command sequence for **A0 / A / A1 / B (+ B1)** arms.  
 VICReg **A1** details: `VICREG_A1_IMPLEMENTATION_PLAN.md`.  
+Masked family **B / B1**: design freeze `LAYER3_ARM_B_B1_SPEC.md`; full status + caveats `LAYER3_COMPLETE_STATUS_B.md` / `LAYER3_COMPLETE_STATUS_B1.md`.  
 Scientific framing: `LAYER3_SCIENTIFIC_REVIEW_BRIEF.md`.  
 **Pre-registration + Step 0/0.5 + CAV metrics:** `LAYER3_PHASE1_PREREGISTRATION.md` (lock before campaign).
 
@@ -17,6 +18,7 @@ Calibration:      per-record healthy only (ZEROSHOT-style)
 A0 control:       Layer 2 features + same scorer (NOT full Layer 2 hard-rule gate)
 VICReg expander:  512,512,512  (not 64,64 — smoke-test only)
 Checkpoints:      --no-random-fallback; verify encoder_info.json checkpoint_loaded
+Pretrain/eval:    exclude gold eval records from SSL pretraining for the clean primary claim
 Seeds:            ≥3 per objective
 Triggers:         oracle (upper bound) AND layer1_adaptive_gated (pipeline claim)
 CIs:              beat Wilson + record-level / record-bootstrap
@@ -72,6 +74,13 @@ Full inventory CSVs also under `Results/layer3/transition_analysis/` locally (gi
 
 ---
 
+## 0a. L2 vs A0 vs A (ready bash jobs)
+
+Three-way compare (full Layer 2 gate vs Phase 1 A0 vs Arm A): see
+[`LAYER3_L2_A0_A_COMPARE.md`](LAYER3_L2_A0_A_COMPARE.md) and scripts in
+[`cluster_jobs/`](cluster_jobs/). Layer 2 accepts the same gold
+`--records-csv` as Phase 1.
+
 ## 0b. MIT-BIH one-seed pilot (do this before full multi-seed)
 
 **Goal:** cheap sanity check on the clean primary cohort only.
@@ -89,6 +98,8 @@ python Layer3/tools/pretrain_encoder.py \
   --checkpoint-dir Results/layer3/pretrain/ntxent_mitbih_seed0 \
   --ssl-objective ntxent \
   --positive-mode same_window \
+  --exclude-records-csv Layer3/reports/pilot_lists/pilot_primary_mitbih_gold.csv \
+  --augment-fs 125 \
   --epochs 100 --batch-size 256 --lr 3e-4 \
   --seed 0 --device cuda
 
@@ -141,6 +152,8 @@ for SEED in 0 1 2; do
     --checkpoint-dir Results/layer3/pretrain/ntxent_seed${SEED} \
     --ssl-objective ntxent \
     --positive-mode same_window \
+    --exclude-records-csv Layer3/reports/pilot_lists/pilot_primary_mitbih_gold.csv \
+    --augment-fs 125 \
     --epochs 100 \
     --batch-size 256 \
     --lr 3e-4 \
@@ -163,6 +176,8 @@ for SEED in 0 1 2; do
     --checkpoint-dir Results/layer3/pretrain/vicreg_seed${SEED} \
     --ssl-objective vicreg \
     --vicreg-expander-dims 512,512,512 \
+    --exclude-records-csv Layer3/reports/pilot_lists/pilot_primary_mitbih_gold.csv \
+    --augment-fs 125 \
     --epochs 100 \
     --batch-size 256 \
     --lr 3e-4 \
@@ -174,7 +189,39 @@ done
 
 ---
 
-## 4. Train B — masked recon + subject-contrastive (ZEROSHOT-inspired)
+## 4. Train B (primary) + B1 (ablation) — masked-reconstruction family
+
+Full rationale + per-arm data policy: [`LAYER3_ARM_B_B1_SPEC.md`](LAYER3_ARM_B_B1_SPEC.md).
+Deep dive / caveats: [`LAYER3_COMPLETE_STATUS_B.md`](LAYER3_COMPLETE_STATUS_B.md),
+[`LAYER3_COMPLETE_STATUS_B1.md`](LAYER3_COMPLETE_STATUS_B1.md).
+
+**B (primary) = masked recon + non-contrastive same-window consistency.**
+Prefer `--healthy-only` (reconstruction on mixed data can normalize pathology).
+
+```bash
+for SEED in 0 1 2; do
+  python Layer3/tools/pretrain_encoder.py \
+    --window-index Results/layer3/window_index/layer3_windows_8s_125hz.csv \
+    --checkpoint-dir Results/layer3/pretrain/mae_consistency_seed${SEED} \
+    --ssl-objective mae_consistency \
+    --healthy-only \
+    --exclude-records-csv Layer3/reports/pilot_lists/pilot_primary_mitbih_gold.csv \
+    --mask-ratio 0.75 \
+    --mask-patch-size 25 \
+    --consistency-lambda 1.0 \
+    --vicreg-expander-dims 512,512,512 \
+    --epochs 100 \
+    --batch-size 256 \
+    --lr 3e-4 \
+    --num-workers 4 \
+    --seed ${SEED} \
+    --device cuda
+done
+```
+
+**B1 (ablation) = masked recon + subject/record contrastive** (Yu / ZEROSHOT-style;
+subject positives can pull healthy+abnormal from one record together — kept as
+an ablation, preferably `--healthy-only`).
 
 ```bash
 for SEED in 0 1 2; do
@@ -182,6 +229,8 @@ for SEED in 0 1 2; do
     --window-index Results/layer3/window_index/layer3_windows_8s_125hz.csv \
     --checkpoint-dir Results/layer3/pretrain/mae_subject_contrastive_seed${SEED} \
     --ssl-objective mae_subject_contrastive \
+    --healthy-only \
+    --exclude-records-csv Layer3/reports/pilot_lists/pilot_primary_mitbih_gold.csv \
     --mask-ratio 0.75 \
     --mask-patch-size 25 \
     --subject-contrastive-lambda 0.3 \
@@ -195,7 +244,8 @@ for SEED in 0 1 2; do
 done
 ```
 
-Decoder discarded at validation time.
+Decoder (and B's expander) discarded at validation time. Anomaly score = encoder
+embedding distance only, never reconstruction error.
 
 ---
 
@@ -204,7 +254,7 @@ Decoder discarded at validation time.
 For each checkpoint:
 
 ```bash
-# Repeat with vicreg_seed${SEED}/encoder_last.pt, mae_subject_contrastive_seed${SEED}/encoder_last.pt, etc.
+# Repeat with vicreg_seed${SEED}/encoder_last.pt, mae_consistency_seed${SEED}/encoder_last.pt, etc.
 CKPT=Results/layer3/pretrain/ntxent_seed0/encoder_last.pt
 OUT=Results/layer3/validation/beat_phase1_ntxent_seed0_8s
 ```
@@ -214,7 +264,8 @@ OUT=Results/layer3/validation/beat_phase1_ntxent_seed0_8s
 ```bash
 python Layer3/validation/run_beat_validation.py \
   --data-dir data \
-  --datasets mit_bih_arrhythmia supraventricular_arrhythmia long_term_atrial_fibrillation noise_stress_test st_petersburg_12lead atrial_fibrillation creighton_vfib \
+  --datasets mit_bih_arrhythmia \
+  --records-csv Layer3/reports/pilot_lists/pilot_primary_mitbih_gold.csv \
   --checkpoint ${CKPT} \
   --out-dir ${OUT} \
   --mode oracle \
@@ -239,6 +290,10 @@ python Layer3/validation/run_beat_validation.py \
 Default decision: conformal α = 0.10 (infeasible α → inhibit all).  
 Phase 1 also reports `healthy_quantile` for comparison.
 
+Primary Phase 1 uses **MIT-BIH gold only**. After the primary run is sane,
+repeat with `--records-csv Layer3/reports/pilot_lists/pilot_secondary_creighton_gold.csv`
+for VF robustness, and only then use LTAFDB as AF-heavy secondary evidence.
+
 Key outputs:
 
 ```text
@@ -248,8 +303,17 @@ phase1_thresholds.csv
 phase1_offline_operating_points.csv   # offline only — uses DANGEROUS labels
 phase1_metrics_overall.csv
 phase1_metrics_by_dataset.csv
+phase1_metrics_bootstrap.csv          # HEADLINE false-permit CI (record-cluster bootstrap)
+phase1_metrics_by_record.csv          # per-record false permit (danger-mass concentration)
+phase1_metrics_by_danger_subtype.csv  # rhythm vs morphology vs noise (C3)
+phase1_cav_l2_l3.csv                  # A0↔L3 CAV + healthy score correlation (C2); needs both arms
 encoder_info.json                     # must show checkpoint_loaded: true
 ```
+
+**Headline uncertainty is now automated:** use `phase1_metrics_bootstrap.csv`
+(record-cluster bootstrap) as the reported CI, not the beat-level Wilson columns.
+`phase1_cav_l2_l3.csv` answers the L2 ⊥ L3 (C2) question and only appears when
+`--phase1-arms a0,layer3`. Bootstrap resamples: `--phase1-bootstrap-n` (default 2000).
 
 **Morphology ablation (1 s):** repeat §5 with `--window-s 1 --guard-s 1` and `--out-dir` suffix `_1s`. Secondary only.
 

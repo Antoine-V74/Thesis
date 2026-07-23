@@ -7,8 +7,8 @@
 Companion to `ZEROSHOT_CLUSTER_RUN_NOTES.md` and
 `LAYER3_ARCHITECTURE_RATIONALE.md`. This document defines **A1**, a
 VICReg-style non-contrastive self-supervised encoder, as a negative-free
-bridge between the current **A** (NT-Xent) arm and the ZEROSHOT-inspired
-**B** (MAE + subject-contrastive) arm.
+bridge between the current **A** (NT-Xent) arm and the masked-reconstruction
+**B** arm. The older subject/record-contrastive variant is now **B1** ablation.
 
 This is a design + implementation plan. The downstream safety decision does
 not change: A1 only swaps the encoder pretraining objective. The permit/inhibit
@@ -44,7 +44,8 @@ for the safety veto, while holding the encoder and downstream scorer fixed:
 ```text
 A  = contrastive with explicit negatives (NT-Xent / SimCLR / CLOCS-style)
 A1 = non-contrastive, no negatives, no reconstruction (VICReg)
-B  = masked reconstruction + subject/record alignment (ZEROSHOT-inspired)
+B  = masked reconstruction + non-contrastive same-window consistency
+B1 = masked reconstruction + subject/record alignment (ZEROSHOT-inspired ablation)
 ```
 
 VICReg is the preferred A1 objective for this thesis stage because:
@@ -78,8 +79,10 @@ more explicit and easier to reason about for a healthy-cloud anomaly model.
 | **A0** | none (Layer 2 handcrafted features) | control floor          | implemented (Phase 1 `a0` arm)                          |
 | **A**  | NT-Xent / CLOCS-style contrastive   | contrastive baseline   | implemented (`--ssl-objective ntxent`)                  |
 | **A1** | VICReg non-contrastive              | negative-free baseline | this plan (`--ssl-objective vicreg`)                    |
-| **B**  | MAE + subject-contrastive           | ZEROSHOT-inspired      | implemented (`--ssl-objective mae_subject_contrastive`) |
-| **C**  | multi-lead upper bound              | appendix only          | deferred                                                |
+| **B**  | MAE + same-window consistency       | masked reconstruction  | implemented (`--ssl-objective mae_consistency`) |
+| **B1** | MAE + subject-contrastive           | ZEROSHOT-inspired      | ablation (`--ssl-objective mae_subject_contrastive`) |
+| **C**  | supervised contrastive (SupCon), labels at pretrain only | supervised representation test | implemented (`--ssl-objective supcon`) |
+| _multi-lead_ | multi-lead upper bound        | deferred appendix (not Arm C) | deferred                                          |
 
 
 All arms share the identical downstream scorer so any difference is attributable

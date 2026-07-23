@@ -1,5 +1,45 @@
 # Layer 3 review and open issues
 
+## July 2026 code audit — fixed
+
+- **Pretrain/eval normalization** now identical (per-window robust median/MAD in
+  both `pretrain_encoder.ContrastiveECGDataset` and `read_wfdb_window`). NB: the
+  window cache is whole-record normalized, but per-window robust norm is affine-
+  equivariant so it cancels the global scaling → pretrain and eval inputs match.
+- **Augmentor sampling rate** now set from `--augment-fs` (default 125 Hz) so
+  baseline-wander/bandpass are calibrated to the real fs; augmentor is also seeded.
+- **`--healthy-only`** fails closed if `is_healthy_window` is absent (no silent mix).
+- **Checkpoint loading**: `build_encoder` now sets `checkpoint_loaded` only when no
+  encoder keys are missing, and under `--no-random-fallback` it RAISES on a missing
+  file, missing state dict, or missing keys (previously it silently ran a random
+  encoder). This makes `--no-random-fallback` trustworthy.
+- **`--exclude-records-csv`** matches only fully-qualified `dataset/record`
+  (no bare-record collisions); writes `pretrain_records.json` provenance.
+- **Phase 1 analysis** now auto-writes record-cluster bootstrap CI, per-record and
+  danger-subtype-stratified false-permit, and A0↔L3 CAV/correlation.
+
+## July 2026 code audit — open (tracked, not yet fixed)
+
+- **Mahalanobis robust pruning** (`layer3_embedding_mahalanobis.fit_robust`) scores
+  calibration points in-sample, not leave-one-out (kNN path already uses LOO). A
+  contaminated "healthy" fit point can survive pruning. Low risk with clean gold
+  records; align with LOO later.
+- **Legacy metrics** (`metrics_legacy_healthy_vs_abnormal.csv`) treat
+  `~is_healthy_window` as abnormal, so BENIGN_ABNORMAL (e.g. isolated PVC) counts as
+  abnormal. Policy metrics and Phase 1 are correct; the legacy table is advisory only.
+- **`SBR` (sinus bradycardia) maps to NORMAL** in `label_grouping` → can enter
+  healthy calibration. Confirm this is intended policy for the safety baseline.
+- **Default (non-`--per-record-calibration`) window validation** uses a global
+  record split; the deployment-shaped per-record path needs the flag. Beat
+  validation is always per-record, so the pilot is unaffected. Consider defaulting
+  window validation to per-record.
+- **Signal cache provenance**: `cache_record_signal` trusts an existing `.npy` on a
+  cache hit (assumes current `--target-fs`/lead). Rebuild with
+  `--overwrite-signal-cache` if fs/lead change; a provenance sidecar would be safer.
+- **Trigger mode (`layer1_adaptive_gated`)** detects R-peaks with a zero-phase
+  (`filtfilt`) filter over the whole record → non-causal by construction. Already
+  labeled offline-only in code/outputs; do not cite as a real-time causal trace.
+
 ## Fixed in cleanup pass
 
 - Direct script execution now uses `Layer3/_bootstrap.py` so tools, validation

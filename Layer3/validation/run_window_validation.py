@@ -108,6 +108,7 @@ def build_anomaly_baseline(
     shrinkage: float,
     eps: float,
     knn_k: int,
+    covariance_estimator: str = "ledoit_wolf",
 ) -> object:
     model = str(anomaly_model).strip().lower()
     if model == "mahalanobis":
@@ -116,6 +117,7 @@ def build_anomaly_baseline(
                 threshold_quantile=threshold_quantile,
                 shrinkage=shrinkage,
                 eps=eps,
+                covariance_estimator=str(covariance_estimator),
             )
         )
     if model == "knn":
@@ -137,6 +139,7 @@ def fit_baseline_with_pruning(
     knn_k: int,
     calibration_outlier_frac: float,
     min_keep: int,
+    covariance_estimator: str = "ledoit_wolf",
 ) -> object:
     baseline = build_anomaly_baseline(
         anomaly_model=anomaly_model,
@@ -144,6 +147,7 @@ def fit_baseline_with_pruning(
         shrinkage=shrinkage,
         eps=eps,
         knn_k=knn_k,
+        covariance_estimator=covariance_estimator,
     )
     if float(calibration_outlier_frac) > 0.0:
         return baseline.fit_robust(
@@ -212,6 +216,7 @@ def fit_score_one_group(
     pca_whiten: bool = False,
     threshold_method: str = "conformal",
     conformal_alpha: float = 0.10,
+    covariance_estimator: str = "ledoit_wolf",
 ) -> Tuple[pd.DataFrame, Dict[str, object]]:
     """Fit one per-record healthy embedding baseline and score all windows in that record.
 
@@ -312,6 +317,7 @@ def fit_score_one_group(
         knn_k=knn_k,
         calibration_outlier_frac=calibration_outlier_frac,
         min_keep=min_fit,
+        covariance_estimator=covariance_estimator,
     )
     fit_scores = baseline.score(emb_transformed[fit_pos])
     val_scores = baseline.score(emb_transformed[val_pos])
@@ -341,6 +347,7 @@ def fit_score_one_group(
         "record_key": str(g["record_key"].iloc[0]),
         "status": "ok" if threshold_ok else "threshold_unavailable",
         "anomaly_model": str(anomaly_model),
+        "covariance_estimator": str(covariance_estimator) if str(anomaly_model).lower() == "mahalanobis" else "",
         "n_windows": int(len(g)),
         "n_healthy": n_healthy,
         "n_fit": int(len(fit_pos)),

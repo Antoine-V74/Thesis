@@ -2,8 +2,8 @@
 
 Companion to the **Layer 3 ZEROSHOT-Inspired Implementation Plan** and
 `LAYER3_ARCHITECTURE_RATIONALE.md`. That plan defines the arms we are training
-now (A0 handcrafted control, A NT-Xent, B ZEROSHOT-style MAE + subject
-contrastive). This document is the backlog of concrete architecture changes we
+now (A0 handcrafted control, A NT-Xent, A1 VICReg, B masked reconstruction +
+same-window consistency, and B1 subject-contrastive ablation). This document is the backlog of concrete architecture changes we
 *could* bring to the current Layer 3 design, why each one might help, and how we
 would validate it before believing it.
 
@@ -95,16 +95,19 @@ confirm we are not under-fitting healthy morphology.
 - *Effort:* M. *Validate:* AUROC + false-permit vs params curve; keep smallest
 model within noise of the best.
 
-### 2.2 SSL objective (extending the B arm)
+### 2.2 SSL objective (masked-reconstruction family)
 
-The B arm (`layer3_masked_ssl.py`, `mae_subject_contrastive`) is the ZEROSHOT
-recipe. Natural follow-ons:
+The primary B arm (`layer3_masked_ssl.py`, `mae_consistency`) is masked
+reconstruction + non-contrastive same-window consistency. The older
+ZEROSHOT-style subject/record-contrastive version is now B1 ablation
+(`mae_subject_contrastive`). Natural follow-ons:
 
 **(a) Masking strategy ablation.**
 Compare random-patch masking vs the NERULA-style *inverse* masking, and sweep
 mask ratio (0.5 / 0.75 / 0.9) and patch size.
 
-- *Why:* ZEROSHOT/NERULA report masking scheme matters more than encoder size.
+- *Why:* NERULA / masked-restoration papers suggest masking scheme matters more
+than encoder size.
 - *Effort:* M (flags already exist). *Validate:* downstream Phase 1, not
 reconstruction loss.
 
@@ -212,7 +215,11 @@ AND, but a learned fusion that can *increase* permit is a safety regression risk
 `compare_layer2_layer3.py` (`layer3_on_layer2_permitted_beats`) — does Layer 3
 catch abnormal beats Layer 2 permits, without new false permits?
 
-### 2.7 Multi-lead (C arm, deferred)
+### 2.7 Multi-lead (deferred appendix — not Arm C)
+
+> Note: "Arm C" now denotes the **supervised-contrastive (SupCon)** encoder
+> (`--ssl-objective supcon`, see `LAYER3_ARM_C_SUPERVISED_SPEC.md`). Multi-lead
+> is a separate deferred appendix item, not Arm C.
 
 **(a) Lead-agnostic encoder / lead dropout.**
 Train so the encoder tolerates single-lead runtime even if multi-lead is used

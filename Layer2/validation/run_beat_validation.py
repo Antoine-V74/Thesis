@@ -86,6 +86,26 @@ from label_grouping import NORMAL  # noqa: E402
 
 _ADAPTIVE_OK = False
 
+
+def _load_record_allowlist(path: Path) -> set[Tuple[str, str]]:
+    """Load (dataset, record) pairs from a CSV with columns dataset, record."""
+    csv_path = Path(path)
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Record allowlist not found: {csv_path}")
+    df = pd.read_csv(csv_path)
+    cols = {c.lower(): c for c in df.columns}
+    if "dataset" not in cols or "record" not in cols:
+        raise ValueError(
+            f"Record allowlist must have columns 'dataset' and 'record' (got {list(df.columns)})"
+        )
+    pairs: set[Tuple[str, str]] = set()
+    for _, row in df.iterrows():
+        ds = str(row[cols["dataset"]]).strip()
+        rec = str(row[cols["record"]]).strip().replace("\\", "/")
+        if ds and rec and ds.lower() != "nan" and rec.lower() != "nan":
+            pairs.add((ds, rec))
+    return pairs
+
 try:
     from scipy.signal import butter, iirnotch, lfilter
     _SCIPY_OK = True
@@ -417,6 +437,7 @@ def run_beat_sync_validation(
     guard_s: float = 5.0,
     use_policy_grouping: bool = True,
     af_treated_as: str = "inhibit",
+    records_csv: Optional[Path] = None,
 ) -> None:
     import wfdb
 
@@ -432,6 +453,15 @@ def run_beat_sync_validation(
     if feature_sets is None:
         feature_sets = ["all", "signal_only", "hybrid_rewarming"]
 
+    allowlist: Optional[set[Tuple[str, str]]] = None
+    if records_csv is not None:
+        allowlist = _load_record_allowlist(Path(records_csv))
+        log.info(
+            "Record allowlist: %d (dataset, record) pairs from %s",
+            len(allowlist),
+            records_csv,
+        )
+
     target = (
         {resolve_dataset(d).folder for d in datasets}
         if datasets else {"mit_bih_arrhythmia"}
@@ -446,6 +476,19 @@ def run_beat_sync_validation(
             continue
         group = DATASET_GROUPS[dataset]
         hea_files = sorted(ds_dir.glob("*.hea"))
+        if allowlist is not None:
+            allowed_recs = {rec for ds, rec in allowlist if ds == dataset}
+            before = len(hea_files)
+            hea_files = [
+                h for h in hea_files
+                if h.stem in allowed_recs or h.stem.split("/")[-1] in allowed_recs
+            ]
+            log.info(
+                "[%s] allowlist kept %d/%d records",
+                dataset,
+                len(hea_files),
+                before,
+            )
         log.info(f"[{dataset}] {len(hea_files)} records")
 
         for hea in hea_files:
@@ -948,6 +991,13 @@ def main(argv=None) -> None:
     p.add_argument("--out-dir", type=Path, default=Path("Results/layer2_beat_sync"))
     p.add_argument("--datasets", nargs="+", default=["mit_bih_arrhythmia"],
                    help="Dataset folder or PhysioNet alias (see data/README.md)")
+    p.add_argument(
+        "--records-csv",
+        type=Path,
+        default=None,
+        help="Optional CSV with columns dataset,record — only these records are scored "
+             "(e.g. Layer3/reports/pilot_lists/pilot_primary_mitbih_gold.csv).",
+    )
     p.add_argument("--feature-sets", nargs="+",
                    default=["all", "signal_only", "hybrid_rewarming"])
     p.add_argument("--morphology-window-s", type=float, default=5.0)
@@ -1055,6 +1105,7 @@ def main(argv=None) -> None:
         cadence_observation_lookahead_s=args.cadence_observation_lookahead_s,
         cadence_min_safe_observations=args.cadence_min_safe_observations,
         cadence_require_last_observation_safe=not args.cadence_allow_unsafe_last_observation,
+        records_csv=args.records_csv,
     )
 
 

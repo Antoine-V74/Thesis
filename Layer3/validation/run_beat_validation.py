@@ -478,6 +478,7 @@ def run_per_record(df: pd.DataFrame, embeddings: np.ndarray, args: argparse.Name
             pca_whiten=args.pca_whiten,
             threshold_method=args.threshold_method,
             conformal_alpha=args.conformal_alpha,
+            covariance_estimator=args.covariance_estimator,
         )
         scored_groups.append(scored)
         thresholds.append(meta)
@@ -576,6 +577,12 @@ def main() -> None:
                    help="Resample windows to this Hz (default: 125 Hz for 8 s rhythm windows). Set <=0 to keep native fs")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:0. auto uses CUDA if available.")
+    p.add_argument("--encoder-pooling-mode",
+                   choices=["auto", "global_avg", "avg_max", "causal_local_global"],
+                   default="auto",
+                   help="Infer from checkpoint by default; explicit values must match. Legacy checkpoints resolve to global_avg.")
+    p.add_argument("--encoder-local-fraction", type=float, default=0.125,
+                   help="Tail fraction used by causal_local_global; 0.125 corresponds to 1 s of an 8 s window.")
     p.add_argument("--threshold-method", default="conformal", choices=["conformal", "healthy_quantile"],
                    help="Main-decision threshold on healthy calibration scores. conformal (default) gives a "
                         "stated healthy false-inhibit budget (--conformal-alpha); healthy_quantile is the "
@@ -585,6 +592,10 @@ def main() -> None:
     p.add_argument("--anomaly-model", default="mahalanobis", choices=["mahalanobis", "knn"],
                    help="Healthy-baseline embedding anomaly scorer.")
     p.add_argument("--shrinkage", type=float, default=0.10)
+    p.add_argument("--covariance-estimator",
+                   choices=["ledoit_wolf", "oas", "diagonal", "diagonal_shrinkage"],
+                   default="ledoit_wolf",
+                   help="Mahalanobis covariance estimator. ledoit_wolf is the locked default.")
     p.add_argument("--eps", type=float, default=1e-6)
     p.add_argument("--knn-k", type=int, default=5,
                    help="Number of healthy calibration neighbors for --anomaly-model knn.")
@@ -617,6 +628,10 @@ def main() -> None:
                    help="Per-record conformal false-inhibit alpha on healthy calibration scores.")
     p.add_argument("--offline-danger-fpr-target", type=float, default=0.02,
                    help="Offline-only labeled operating point target for DANGEROUS false permits. Not deployable calibration.")
+    p.add_argument("--phase1-bootstrap-n", type=int, default=2000,
+                   help="Record-cluster bootstrap resamples for the headline false-permit CI (Phase 1).")
+    p.add_argument("--phase1-bootstrap-seed", type=int, default=12345,
+                   help="Seed for the Phase 1 record-cluster bootstrap.")
     p.add_argument("--a0-feature-window-s", type=float, default=5.0,
                    help="Handcrafted A0 Layer-2 morphology feature window in seconds.")
     p.add_argument("--a0-rr-lookback-s", type=float, default=30.0,
@@ -646,9 +661,20 @@ def main() -> None:
         checkpoint=args.checkpoint,
         device=args.device,
         allow_random_fallback=not args.no_random_fallback,
+        pooling_mode=args.encoder_pooling_mode,
+        local_fraction=args.encoder_local_fraction,
     )
     resolved_device = str(encoder_info.get("device", args.device))
     encoder_info["seed"] = int(args.seed)
+    checkpoint_window_s = encoder_info.get("checkpoint_window_s")
+    if checkpoint_window_s is not None and not np.isclose(
+        float(checkpoint_window_s), float(args.window_s), rtol=0.0, atol=1e-6
+    ):
+        raise RuntimeError(
+            f"Checkpoint was pretrained on {checkpoint_window_s}s windows but evaluation requested "
+            f"{args.window_s}s. Use a matching checkpoint/window or explicitly create a documented "
+            "cross-window ablation instead of silently shifting distributions."
+        )
     write_json(out_dir / "encoder_info.json", encoder_info)
     if encoder_info.get("source", "").startswith("RandomConvEncoder"):
         LOG.warning("Beat-sync validation is using a random fallback encoder; results are smoke-test only.")
@@ -705,6 +731,8 @@ def main() -> None:
             phase1_thresholds,
             out_dir,
             offline_danger_fpr_target=args.offline_danger_fpr_target,
+            bootstrap_n=args.phase1_bootstrap_n,
+            bootstrap_seed=args.phase1_bootstrap_seed,
         )
         phase1_files = [
             "phase1_per_beat.csv",
@@ -713,6 +741,10 @@ def main() -> None:
             "phase1_metrics_by_dataset.csv",
             "phase1_metrics_overall.csv",
             "phase1_aurocs.csv",
+            "phase1_metrics_bootstrap.csv",
+            "phase1_metrics_by_record.csv",
+            "phase1_metrics_by_danger_subtype.csv",
+            "phase1_cav_l2_l3.csv",
         ]
 
     runtime = {
@@ -789,7 +821,10 @@ def main() -> None:
             f.write(f"- Conformal alpha: `{args.conformal_alpha}`\n")
             f.write("- Conformal guarantee is only for false-inhibit / false alarm on healthy data under exchangeability; it does not guarantee false-permit on dangerous beats.\n")
             f.write(f"- Offline labeled DANGEROUS operating point target: `{args.offline_danger_fpr_target}` false permits. This is non-deployable and uses DANGEROUS test labels.\n")
-            f.write("- Files: `phase1_per_beat.csv`, `phase1_thresholds.csv`, `phase1_offline_operating_points.csv`, `phase1_metrics_by_dataset.csv`, `phase1_metrics_overall.csv`, `phase1_aurocs.csv`\n")
+            f.write("- Headline false-permit CI is `phase1_metrics_bootstrap.csv` (record-cluster bootstrap); Wilson beat CIs are transparency only.\n")
+            f.write("- `phase1_cav_l2_l3.csv` reports A0 vs Layer 3 conditional added value + healthy score correlation (L2 vs L3 redundancy).\n")
+            f.write("- `phase1_metrics_by_danger_subtype.csv` splits false-permit into rhythm / morphology / noise origin.\n")
+            f.write("- Files: `phase1_per_beat.csv`, `phase1_thresholds.csv`, `phase1_offline_operating_points.csv`, `phase1_metrics_by_dataset.csv`, `phase1_metrics_overall.csv`, `phase1_aurocs.csv`, `phase1_metrics_bootstrap.csv`, `phase1_metrics_by_record.csv`, `phase1_metrics_by_danger_subtype.csv`, `phase1_cav_l2_l3.csv`\n")
 
     LOG.info("Wrote Layer 3 beat-sync validation outputs to %s", out_dir)
 

@@ -92,10 +92,10 @@ def build_pptx() -> None:
         "Why beat-synchronous evaluation?",
         [
             "One trigger beat → one window → one embedding → one permit/inhibit",
-            "Preferred window: 1 s @ 125 Hz (local QRS morphology, not long context)",
+            "Primary window: 8 s @ 125 Hz (rhythm + morphology; L3 must carry rhythm itself)",
+            "Morphology ablation: 1 s window (local QRS) — secondary, not the primary claim",
             "Causal window + optional 50–150 ms post-R lookahead (stimulation latency sim)",
-            "Oracle mode (MIT-BIH annotations): upper-bound offline analysis",
-            "Layer 1 gated mode: closer to closed-loop deployment",
+            "Oracle mode vs Layer 1 gated mode (upper bound vs closed-loop deployment)",
         ],
         "Fixed sliding windows dilute the current beat with surrounding rhythm. "
         "Beat-sync evaluation matches how the controller actually decides.",
@@ -103,16 +103,16 @@ def build_pptx() -> None:
 
     _add_slide(
         prs,
-        "Encoder + self-supervised pretraining",
+        "Encoder pretraining (self-supervised + supervised)",
         [
             "ECGEncoder1D: 1D ResNet, GroupNorm, 128-d embedding",
-            "Pretrained on unlabeled ECG with physiology-aware augmentations",
-            "Projection/expander heads used only during training — discarded at deploy",
-            "Healthy-only pretraining ablation: train SSL only on healthy-labeled windows",
-            "Human pretrain → frozen encoder → per-rat/session baseline re-fit",
+            "SSL arms (A/A1/B/B1): unlabeled ECG + physiology-aware augmentations",
+            "Arm C: supervised contrastive (SupCon) using public labels at PRETRAIN ONLY",
+            "All heads (projection/expander/SupCon) discarded — deploy is label-free one-class",
+            "Human pretrain → frozen encoder → per-record/session healthy baseline re-fit",
         ],
-        "Augmentations preserve semantic content: amplitude scaling, baseline wander, "
-        "small time shifts, noise — not random crops that destroy QRS shape.",
+        "Key distinction: labels may shape the encoder offline (Arm C), but the deployed "
+        "decision never sees a danger label — it only fits a healthy baseline per subject.",
     )
 
     _add_slide(
@@ -122,11 +122,12 @@ def build_pptx() -> None:
             "A0 — Layer 2 handcrafted features → Mahalanobis/kNN (control floor)",
             "A — NT-Xent / CLOCS-style contrastive SSL (baseline learned encoder)",
             "A1 — VICReg non-contrastive SSL (no negatives, no reconstruction)",
-            "B — MAE 75% mask + subject-contrastive (ZEROSHOT/NERULA-inspired)",
-            "C — multi-lead upper bound (3KG/ST-MEM) — appendix only",
+            "B — MAE mask + same-window consistency (primary masked arm)",
+            "B1 — MAE + subject/record contrastive (ablation; prefer healthy-only)",
+            "C — Supervised contrastive (SupCon): public labels at pretrain, label-free deploy",
         ],
-        "All arms share the identical scorer and threshold logic. "
-        "Any performance difference is attributable to representation quality, not the decision rule.",
+        "All arms share the identical scorer and threshold logic, so any difference is "
+        "representation quality, not the decision rule. Multi-lead is a future appendix, not Arm C.",
     )
 
     _add_slide(
@@ -161,13 +162,14 @@ def build_pptx() -> None:
         prs,
         "Current implementation status",
         [
-            "Encoder, augmentations, Mahalanobis/kNN scorer — implemented",
-            "Beat-sync + window validation harness with Phase 1 tables — implemented",
-            "SSL arms A (NT-Xent), B (MAE+subject-contrastive), A1 (VICReg) — implemented",
-            "Conformal threshold default + threshold_coverage.csv — implemented",
-            "Deep SVDD ablation head — optional, not primary path",
+            "Encoder, augmentations, Mahalanobis/kNN scorer, conformal threshold — implemented",
+            "Beat-sync + window validation harness with Phase 1 tables + record bootstrap — implemented",
+            "SSL arms A (NT-Xent), A1 (VICReg), B (MAE+consistency), B1 (subject-contrastive) — implemented",
+            "Arm C (SupCon supervised) — implemented; labels pretrain-only, encoder-only checkpoint",
+            "Exploratory 8 s runs: SSL arms not yet clearly beating A0 → motivates Arm C + locked gold pilot",
         ],
-        "End-to-end smoke test covers index build, pretrain, validation, and comparison to Layer 2.",
+        "End-to-end smoke test covers index build, pretrain (incl. supcon), validation, and comparison to A0. "
+        "Headline safety numbers await the locked MIT-BIH gold pilot on the cluster.",
     )
 
     _add_slide(
@@ -188,14 +190,14 @@ def build_pptx() -> None:
         prs,
         "Next steps",
         [
-            "Cluster runs: A0 + A + A1 + B with matched config, seeds 0/1/2",
-            "Phase 1 tables: false-permit on DANGEROUS at conformal α=10% + Wilson CIs",
-            "Compare beat-sync oracle vs Layer 1 gated trigger modes",
-            "Healthy-only SSL ablation vs all-window SSL",
+            "Locked gold pilot: A0 + A + A1 + B (+B1 ablation) on MIT-BIH gold, matched config",
+            "Add Arm C (SupCon) as the 'do labels help the representation?' test",
+            "Phase 1 tables: false-permit on DANGEROUS at conformal α=10% + record-bootstrap CIs",
+            "Compare beat-sync oracle vs Layer 1 gated trigger modes; CAV vs A0",
             "Rat baseline workflow once healthy rat ECG is available",
         ],
-        "First deliverable is defensible safety tables comparing encoder families, "
-        "not perfect AUROC. Multi-lead C arm remains appendix unless hardware changes.",
+        "First deliverable is defensible safety tables comparing encoder families "
+        "(incl. supervised Arm C), not AUROC. Multi-lead remains a future appendix, not Arm C.",
     )
 
     _add_slide(
@@ -269,18 +271,19 @@ ECG → ECGEncoder1D → 128-d embedding → Mahalanobis/kNN → threshold → p
 ## Slide 5 — Beat-synchronous evaluation
 
 - One beat → one decision
-- 1 s window @ 125 Hz
+- Primary window: 8 s @ 125 Hz (rhythm + morphology)
+- Morphology ablation: 1 s window (secondary)
 - Causal + optional post-R lookahead (50–150 ms)
 - Oracle vs Layer 1 gated modes
 
 ---
 
-## Slide 6 — SSL pretraining
+## Slide 6 — Encoder pretraining (SSL + supervised)
 
-- Physiology-aware augmentations
-- Training heads discarded at deploy
-- Healthy-only SSL ablation available
-- Human pretrain → per-session baseline re-fit
+- SSL arms (A/A1/B/B1): unlabeled ECG + physiology-aware augmentations
+- Arm C: supervised contrastive using public labels **at pretrain only**
+- All training heads discarded → deploy is label-free one-class
+- Human pretrain → frozen encoder → per-session healthy baseline re-fit
 
 ---
 
@@ -291,10 +294,11 @@ ECG → ECGEncoder1D → 128-d embedding → Mahalanobis/kNN → threshold → p
 | A0 | Layer 2 handcrafted (control) |
 | A | NT-Xent contrastive |
 | A1 | VICReg non-contrastive |
-| B | MAE + subject-contrastive |
-| C | Multi-lead (appendix) |
+| B | MAE + same-window consistency (primary masked) |
+| B1 | MAE + subject-contrastive (ablation) |
+| C | Supervised contrastive (SupCon) — labels pretrain-only |
 
-Fixed downstream scorer isolates encoder quality.
+Fixed downstream scorer isolates encoder quality. Multi-lead = future appendix, not Arm C.
 
 ---
 
@@ -317,9 +321,11 @@ Fixed downstream scorer isolates encoder quality.
 
 ## Slide 10 — Status
 
-- Full pipeline implemented (encoder, scorer, validation, A/A1/B SSL)
-- Conformal threshold default
-- Smoke test available
+- Full pipeline implemented (encoder, scorer, validation, conformal threshold)
+- SSL arms A / A1 / B / B1 implemented
+- Arm C (SupCon supervised) implemented — labels pretrain-only, encoder-only checkpoint
+- Exploratory 8 s runs: SSL not yet clearly beating A0 → motivates Arm C + locked pilot
+- Smoke test covers index build, pretrain (incl. supcon), validation
 
 ---
 
@@ -333,8 +339,9 @@ Fixed downstream scorer isolates encoder quality.
 
 ## Slide 12 — Next steps
 
-- Cluster A0/A/A1/B comparison
-- Phase 1 safety tables with CIs
+- Locked gold pilot: A0 / A / A1 / B (+B1 ablation) on MIT-BIH gold
+- Add Arm C (SupCon): does using labels at pretrain help the representation?
+- Phase 1 safety tables: false-permit + record-bootstrap CIs; CAV vs A0
 - Rat baseline when data available
 
 ---

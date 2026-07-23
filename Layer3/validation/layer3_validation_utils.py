@@ -259,7 +259,22 @@ class RandomConvEncoder(nn.Module):
         return self.proj(h)
 
 
-def _try_instantiate_encoder(cls: Any) -> nn.Module:
+def _try_instantiate_encoder(
+    cls: Any,
+    encoder_config_cls: Any = None,
+    pooling_mode: str = "global_avg",
+    local_fraction: float = 0.125,
+) -> nn.Module:
+    if encoder_config_cls is not None:
+        try:
+            cfg = encoder_config_cls(
+                pooling_mode=str(pooling_mode),
+                local_fraction=float(local_fraction),
+            )
+            return cls(cfg)
+        except Exception:
+            # Fall through to legacy constructor probing for external encoders.
+            pass
     constructors = [
         {},
         {"in_channels": 1},
@@ -277,8 +292,44 @@ def _try_instantiate_encoder(cls: Any) -> nn.Module:
     raise RuntimeError(f"Could not instantiate ECGEncoder1D with common signatures: {last_exc}")
 
 
-def build_encoder(checkpoint: Optional[str], device: str = "auto", allow_random_fallback: bool = True) -> Tuple[nn.Module, Dict[str, Any]]:
+def build_encoder(
+    checkpoint: Optional[str],
+    device: str = "auto",
+    allow_random_fallback: bool = True,
+    pooling_mode: str = "auto",
+    local_fraction: float = 0.125,
+) -> Tuple[nn.Module, Dict[str, Any]]:
     device = resolve_torch_device(device)
+    requested_pooling_mode = str(pooling_mode).lower()
+    if requested_pooling_mode not in {"auto", "global_avg", "avg_max", "causal_local_global"}:
+        raise ValueError(f"Unsupported pooling_mode={pooling_mode!r}")
+    loaded_checkpoint: Any = None
+    checkpoint_config: Dict[str, Any] = {}
+    checkpoint_path = Path(checkpoint) if checkpoint else None
+    if checkpoint_path is not None and checkpoint_path.exists():
+        try:
+            loaded_checkpoint = torch.load(str(checkpoint_path), map_location="cpu", weights_only=True)
+        except TypeError:
+            loaded_checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+        except Exception:
+            # Trusted project checkpoint; mirror the established fallback below.
+            loaded_checkpoint = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+        if isinstance(loaded_checkpoint, dict) and isinstance(loaded_checkpoint.get("config"), dict):
+            checkpoint_config = dict(loaded_checkpoint["config"])
+
+    checkpoint_pooling_mode = str(checkpoint_config.get("encoder_pooling_mode", "global_avg")).lower()
+    checkpoint_local_fraction = float(checkpoint_config.get("encoder_local_fraction", local_fraction))
+    if requested_pooling_mode == "auto":
+        resolved_pooling_mode = checkpoint_pooling_mode
+        resolved_local_fraction = checkpoint_local_fraction
+    else:
+        resolved_pooling_mode = requested_pooling_mode
+        resolved_local_fraction = float(local_fraction)
+        if checkpoint_config and resolved_pooling_mode != checkpoint_pooling_mode:
+            raise RuntimeError(
+                f"Encoder pooling mismatch: checkpoint uses {checkpoint_pooling_mode!r}, "
+                f"but evaluation requested {resolved_pooling_mode!r}."
+            )
     info: Dict[str, Any] = {
         "source": None,
         "checkpoint": checkpoint,
@@ -286,6 +337,12 @@ def build_encoder(checkpoint: Optional[str], device: str = "auto", allow_random_
         "device": device,
         "cuda_available": bool(torch.cuda.is_available()),
         "warnings": [],
+        "pooling_mode": resolved_pooling_mode,
+        "local_fraction": resolved_local_fraction,
+        "checkpoint_pooling_mode": checkpoint_pooling_mode if checkpoint_config else None,
+        "checkpoint_window_s": checkpoint_config.get("window_s") if checkpoint_config else None,
+        "checkpoint_window_n_samples": checkpoint_config.get("window_n_samples") if checkpoint_config else None,
+        "checkpoint_window_target_fs": checkpoint_config.get("window_target_fs") if checkpoint_config else None,
     }
 
     model: Optional[nn.Module] = None
@@ -293,7 +350,13 @@ def build_encoder(checkpoint: Optional[str], device: str = "auto", allow_random_
         try:
             mod = importlib.import_module(mod_name)
             cls = getattr(mod, "ECGEncoder1D")
-            model = _try_instantiate_encoder(cls)
+            config_cls = getattr(mod, "EncoderConfig", None)
+            model = _try_instantiate_encoder(
+                cls,
+                encoder_config_cls=config_cls,
+                pooling_mode=resolved_pooling_mode,
+                local_fraction=resolved_local_fraction,
+            )
             info["source"] = mod_name + ".ECGEncoder1D"
             break
         except Exception as exc:
@@ -313,18 +376,7 @@ def build_encoder(checkpoint: Optional[str], device: str = "auto", allow_random_
             # that contain a config dict. We try the safe path first and fall back to
             # weights_only=False only if necessary. Checkpoints are trusted artifacts
             # produced by our own pretraining; the fallback is acceptable here.
-            ckpt = None
-            try:
-                ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
-            except TypeError:
-                # Older torch without weights_only kwarg
-                ckpt = torch.load(str(ckpt_path), map_location="cpu")
-            except Exception as exc:
-                info["warnings"].append(
-                    f"weights_only torch.load failed for {checkpoint}: {exc}. "
-                    f"Retrying with weights_only=False (trusted checkpoint)."
-                )
-                ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+            ckpt = loaded_checkpoint
             state = ckpt
             if isinstance(ckpt, dict):
                 for key in ("encoder_state_dict", "model_state_dict", "state_dict", "encoder", "model"):
@@ -346,19 +398,35 @@ def build_encoder(checkpoint: Optional[str], device: str = "auto", allow_random_
                                 changed = True
                     cleaned[nk] = v
                 missing, unexpected = model.load_state_dict(cleaned, strict=False)
-                info["checkpoint_loaded"] = True
                 info["missing_keys"] = list(missing)
                 info["unexpected_keys"] = list(unexpected)
-                if len(missing) > 0 or len(unexpected) > 0:
+                # Only call it "loaded" if the core encoder weights were all found.
+                # Missing keys mean the encoder is partly random (architecture or
+                # objective mismatch), which would silently produce garbage Layer 3
+                # scores — fail closed unless random fallback is explicitly allowed.
+                info["checkpoint_loaded"] = len(missing) == 0
+                if len(missing) > 0:
+                    msg = (
+                        f"Checkpoint {checkpoint} is missing {len(missing)} encoder key(s); "
+                        "the encoder architecture/objective likely does not match, so weights are partly random."
+                    )
+                    if not allow_random_fallback:
+                        raise RuntimeError(msg + " Refusing to continue (--no-random-fallback).")
+                    get_logger().warning(msg)
+                elif len(unexpected) > 0:
                     get_logger().warning(
-                        "Checkpoint loaded with %d missing and %d unexpected keys; "
-                        "verify the encoder architecture matches the pretraining config.",
-                        len(missing), len(unexpected),
+                        "Checkpoint loaded cleanly with %d unexpected key(s) ignored.", len(unexpected)
                     )
             else:
-                info["warnings"].append(f"Checkpoint {checkpoint} did not contain a state dict; ignored.")
+                msg = f"Checkpoint {checkpoint} did not contain a recognizable state dict."
+                if not allow_random_fallback:
+                    raise RuntimeError(msg + " Refusing to continue (--no-random-fallback).")
+                info["warnings"].append(msg + " Ignored; using random weights.")
         else:
-            info["warnings"].append(f"Checkpoint {checkpoint} not found; using current/random encoder weights.")
+            msg = f"Checkpoint {checkpoint} not found; the encoder would use random weights."
+            if not allow_random_fallback:
+                raise RuntimeError(msg + " Refusing to continue (--no-random-fallback). Check the --checkpoint path.")
+            info["warnings"].append(msg)
 
     model = model.to(device)
     model.eval()

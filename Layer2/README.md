@@ -56,11 +56,19 @@ Layer2/
 
 | Pareto / operating point | `validation/run_pareto_sweep.py {quick,full,posthoc}` |
 
+| Neyman-Pearson operating point + worst-record | `validation/run_np_operating_point.py` |
+
+| Artifact / lead-off stress test (SQI gate) | `validation/run_artifact_stress_test.py` |
+
 | Causal lookahead sweep | `validation/run_causal_lookahead_sweep.py` |
 
 The deployment-like scripts also report a prospective cadence mode: observe 7
 unstimulated beats with a longer causal lookahead, then stimulate only the 8th
 beat if at least 6 of those decisions were safe and the 7th beat was safe.
+
+Optional `--records-csv` (columns `dataset,record`) restricts scoring to a gold
+allowlist — use the same MIT-BIH gold CSV as Layer 3 Phase 1 when comparing
+full Layer 2 vs A0 vs Arm A (`Layer3/reports/LAYER3_L2_A0_A_COMPARE.md`).
 
 ### Figures (CSV in -> plots out)
 
@@ -122,5 +130,37 @@ See [viz/README.md](viz/README.md) for details.
 
     --per-beat Results\layer2\cross_dataset_causal_100ms\per_beat.csv
 
+
+
+# Neyman-Pearson operating point + worst-record danger leak (offline, label-aware)
+
+.\.venv\Scripts\python.exe Layer2\validation\run_np_operating_point.py `
+
+    --per-beat Results\layer2_beat_validation\per_beat.csv `
+
+    --out-dir Results\layer2_np_operating_point --danger-budget 0.01
+
+
+
+# Artifact / lead-off stress test for the SQI gate
+
+.\.venv\Scripts\python.exe Layer2\validation\run_artifact_stress_test.py `
+
+    --data-dir data --dataset mit_bih_arrhythmia `
+
+    --out-dir Results\layer2_artifact_stress
+
 ```
+
+### Artifact-robustness feature flags (opt-in)
+
+The SQI ensemble and ICD-style discriminators are OFF by default so the frozen
+feature set and existing calibrations are unchanged. Enable them via
+`extract_layer2_features(..., compute_sqi_ensemble=True, compute_onset_stability=True)`
+and calibrate with `decision.config.hard_rules_with_extensions(include_sqi_ensemble=True)`.
+
+**Do not flip into `DEFAULT_HARD_RULES` until the SQI flip-on gate passes**
+([ALGORITHM_SUMMARY.md](ALGORITHM_SUMMARY.md) → "SQI flip-on gate"): stress-test
+first → recalibrate cutoffs → only then wire into beat validation / frozen gate.
+Cluster default is SQI-only: `bash Layer2/validation/run_l2_artifact_np.sh`.
 

@@ -21,9 +21,12 @@ from .config import (
     FROZEN_COUPLING_THRESHOLD,
     FROZEN_ZSCORE_QUANTILE,
     NON_DROPPABLE_HARD_RULES,
+    ONSET_STABILITY_REFERENCE_LIMITS,
     RELIABILITY_DEFAULTS,
     RRReliabilityConfig,
+    SQI_ENSEMBLE_HARD_RULES,
     check_rr_reliability,
+    hard_rules_with_extensions,
 )
 from .gate import GateMixin
 
@@ -76,8 +79,11 @@ __all__ = [
     "FROZEN_COUPLING_THRESHOLD",
     "FROZEN_ZSCORE_QUANTILE",
     "NON_DROPPABLE_HARD_RULES",
+    "ONSET_STABILITY_REFERENCE_LIMITS",
     "RELIABILITY_DEFAULTS",
     "RRReliabilityConfig",
+    "SQI_ENSEMBLE_HARD_RULES",
     "check_rr_reliability",
+    "hard_rules_with_extensions",
     "features_to_vector",
 ]

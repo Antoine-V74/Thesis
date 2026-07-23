@@ -11,6 +11,25 @@ By default the policy now allows one observation beat to fail, but requires the
 most recent observation beat to be safe. This avoids blocking therapy because
 of one isolated noisy observation while still requiring a safe state just before
 the candidate beat.
+
+Persistence / "X-of-Y" formalism
+---------------------------------
+This gate is an X-of-Y persistence detector, the same design used for arrhythmia
+onset confirmation in implantable defibrillators and AEDs (e.g. Medtronic NID
+"number of intervals to detect", Boston Scientific duration/persistence windows,
+and the sustained-rate criteria surveyed in Swerdlow et al. 1994). The safety
+analogue is deliberately inverted: instead of requiring X-of-Y fast intervals to
+CONFIRM danger and shock, we require X-of-Y SAFE observation beats to permit
+stimulation, so uncertainty defaults to inhibit.
+
+    Y = observation_beats            (window length, "of Y")
+    X = min_safe_observations        (required safe count, "X of")
+    plus an optional most-recent-beat guard (require_last_observation_safe).
+
+Requiring persistence over Y beats trades a small amount of latency (you cannot
+permit until Y beats have been observed) for strong rejection of single-beat
+artifacts and transient misdetections, which is the correct trade for an
+inhibit-only safety gate.
 """
 from __future__ import annotations
 
@@ -40,6 +59,34 @@ class ProspectiveCadenceGate:
     require_trigger_ok: bool = True
     _phase: int = 0
     _observations: List[Tuple[bool, str]] = field(default_factory=list)
+
+    @classmethod
+    def from_x_of_y(
+        cls,
+        x_safe: int,
+        y_observed: int,
+        *,
+        cycle_length: Optional[int] = None,
+        require_last_observation_safe: bool = True,
+        require_trigger_ok: bool = True,
+    ) -> "ProspectiveCadenceGate":
+        """
+        Build a gate from an explicit X-of-Y persistence rule.
+
+        Permit the stimulation candidate only if at least ``x_safe`` of the last
+        ``y_observed`` observation beats were safe (and, by default, the most
+        recent one). ``cycle_length`` defaults to ``y_observed + 1`` so the
+        candidate beat immediately follows the Y-beat observation window.
+        """
+        if cycle_length is None:
+            cycle_length = int(y_observed) + 1
+        return cls(
+            cycle_length=int(cycle_length),
+            observation_beats=int(y_observed),
+            min_safe_observations=int(x_safe),
+            require_last_observation_safe=require_last_observation_safe,
+            require_trigger_ok=require_trigger_ok,
+        )
 
     def __post_init__(self) -> None:
         if self.cycle_length < 2:

@@ -238,12 +238,21 @@ Apply the same bootstrap to CAV if sample size allows; otherwise report CAV poin
 
 ### 4.6 Where to compute
 
+**Now automated** by `write_phase1_outputs` in `layer3_phase1_eval.py` (written on
+every `--phase1-eval` run):
 
-| Metric                   | Suggested source                                                 |
-| ------------------------ | ---------------------------------------------------------------- |
-| False-permit, stratified | `phase1_per_beat.csv` + subtype map                              |
-| Score correlation / CAV  | Join A0 and layer3 rows from Phase 1 (`--phase1-arms a0,layer3`) |
-| System AND with full L2  | `compare_layer2_layer3.py` (different question — full gate)      |
+
+| Metric                        | Output file (automated)                                          |
+| ----------------------------- | ---------------------------------------------------------------- |
+| False-permit, stratified      | `phase1_metrics_by_danger_subtype.csv` (danger_subtype mapping)  |
+| Record-cluster bootstrap CI   | `phase1_metrics_bootstrap.csv` (headline uncertainty)            |
+| Per-record false permit       | `phase1_metrics_by_record.csv`                                   |
+| Score correlation / CAV       | `phase1_cav_l2_l3.csv` (requires `--phase1-arms a0,layer3`)      |
+| System AND with full L2       | `compare_layer2_layer3.py` (different question — full gate)      |
+
+Subtype mapping is `danger_subtype()` in `layer3_phase1_eval.py`; document any
+dataset-specific rule change in MANIFEST. Bootstrap resamples set with
+`--phase1-bootstrap-n` (default 2000).
 
 
 ---

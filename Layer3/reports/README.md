@@ -2,11 +2,22 @@
 
 One place to find Layer 3 docs. If you are lost, start here.
 
+**Agents:** do not paste this whole folder into context; open the one status
+file for the arm you are editing (or `LAYER3_CONSOLIDATED_SUMMARY.md` if lost).
+
 ```text
 Lost? Read ONE medium file → LAYER3_CONSOLIDATED_SUMMARY.md
+Complete A0-first status     → LAYER3_COMPLETE_STATUS_A0_FIRST.md  ← A0 control deep dive
+Complete Arm A status        → LAYER3_COMPLETE_STATUS_A.md         ← NT-Xent SSL arm deep dive
+Complete Arm B status        → LAYER3_COMPLETE_STATUS_B.md         ← masked recon + consistency deep dive
+Complete Arm B1 status       → LAYER3_COMPLETE_STATUS_B1.md        ← subject-contrastive ablation deep dive
+Complete Arm C status        → LAYER3_COMPLETE_STATUS_C.md         ← SupCon supervised: code, diagrams, papers, futures
+L2 vs A0 vs A compare        → LAYER3_L2_A0_A_COMPARE.md           ← cluster jobs + comparison table
+Phase 1 output metrics guide → LAYER3_PHASE1_OUTPUT_METRICS.md     ← what each CSV column means
 Short overview               → LAYER3_SUPERVISOR_SUMMARY.md
 Pilot Go + gold allowlists   → pilot_lists/MANIFEST.md
 Cluster / pilot commands     → ZEROSHOT_CLUSTER_RUN_NOTES.md  (§0b)
+Offline while GPU blocked    → LAYER3_CONSOLIDATED_SUMMARY.md (§8b) + cluster_jobs/
 External AI review prompt    → LAYER3_SCIENTIFIC_REVIEW_BRIEF.md
 Slides                       → LAYER3_SUPERVISOR_DECK.pptx
 Full algorithm               → ../ALGORITHM_SUMMARY.md
@@ -23,7 +34,21 @@ VICReg expander `512,512,512`; ZEROSHOT-style per-record healthy Mahalanobis; 1 
 
 | File | Role |
 | --- | --- |
-| [`LAYER3_CONSOLIDATED_SUMMARY.md`](LAYER3_CONSOLIDATED_SUMMARY.md) | **Main medium summary** — papers, gold runs, ablations, generalization, next steps (read this first) |
+| [`LAYER3_COMPLETE_STATUS_A0_FIRST.md`](LAYER3_COMPLETE_STATUS_A0_FIRST.md) | **Complete A0 status** — handcrafted control deep dive, fixes, open issues |
+| [`LAYER3_COMPLETE_STATUS_A.md`](LAYER3_COMPLETE_STATUS_A.md) | **Complete Arm A status** — NT-Xent SSL: train, eval, caveats, outputs, go/no-go |
+| [`LAYER3_COMPLETE_STATUS_B.md`](LAYER3_COMPLETE_STATUS_B.md) | **Complete Arm B status** — masked recon + same-window consistency: train, eval, caveats |
+| [`LAYER3_COMPLETE_STATUS_B1.md`](LAYER3_COMPLETE_STATUS_B1.md) | **Complete Arm B1 status** — masked + subject contrastive ablation: train, eval, caveats |
+| [`LAYER3_COMPLETE_STATUS_C.md`](LAYER3_COMPLETE_STATUS_C.md) | **Complete Arm C status** — SupCon: rationale, papers, diagrams, code path, caveats, future directions |
+| [`LAYER3_ARM_B_B1_SPEC.md`](LAYER3_ARM_B_B1_SPEC.md) | **B/B1 design freeze** — short canonical definition of masked family |
+| [`LAYER3_ARM_C_SUPERVISED_SPEC.md`](LAYER3_ARM_C_SUPERVISED_SPEC.md) | **Arm C spec** — supervised-pretrained (SupCon) representation ceiling |
+| [`LAYER3_ARM_C_LADDER_SPEC.md`](LAYER3_ARM_C_LADDER_SPEC.md) | **Arm C ladder (C1/C2/C3)** — exploratory SupCon+OE / Deep SAD / hybrid improvements |
+| [`LAYER3_TRANSFER_CREIGHTON_SPEC.md`](LAYER3_TRANSFER_CREIGHTON_SPEC.md) | **Tier 3A transfer** — MIT-BIH→Creighton VF, frozen encoder + re-fit baseline, no retrain |
+| [`LAYER3_ARM_C_SUPERVISED_SPEC.md`](LAYER3_ARM_C_SUPERVISED_SPEC.md) | **Arm C design freeze** — short canonical SupCon definition; C-ce/C-oe deferred |
+| [`LAYER3_L2_A0_A_COMPARE.md`](LAYER3_L2_A0_A_COMPARE.md) | **L2 vs A0 vs A** — framing, MAD/L2/augs, cluster scripts, fill-in results table |
+| [`cluster_jobs/`](cluster_jobs/) | Bash job scripts for the MIT-BIH gold L2 / A0 / A pilot |
+| [`LAYER3_PHASE1_OUTPUT_METRICS.md`](LAYER3_PHASE1_OUTPUT_METRICS.md) | **Output metrics guide** — every Phase 1 / main Layer 2 CSV explained |
+| [`LAYER3_CONSOLIDATED_SUMMARY.md`](LAYER3_CONSOLIDATED_SUMMARY.md) | **Main medium summary** — papers, gold runs, ablations, generalization, next steps |
+| [`2026-07-22_END_OF_DAY_SUMMARY.md`](2026-07-22_END_OF_DAY_SUMMARY.md) | **22/07 decision record** — in-domain vs transfer, two-label insight → Arm C, why calibration is valid, alternatives, open gaps |
 | [`LAYER3_SCIENTIFIC_REVIEW_BRIEF.md`](LAYER3_SCIENTIFIC_REVIEW_BRIEF.md) | Critical peer-review brief for an AI agent / external reader |
 | [`LAYER3_PHASE1_PREREGISTRATION.md`](LAYER3_PHASE1_PREREGISTRATION.md) | **Locked Phase 1 protocol:** Step 0/0.5 gate, CAV metrics, pre-registration paragraph |
 | [`LAYER3_REVIEW_WEAKNESSES_C1_C5.md`](LAYER3_REVIEW_WEAKNESSES_C1_C5.md) | **Canonical notes** of external review C1–C5 (power, independence, 8 s, redundancy, conformal) |

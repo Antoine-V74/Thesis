@@ -45,7 +45,11 @@ import numpy as np
 
 from morphology_features import morphology_features
 from rhythm_features import rhythm_features
-from signal_features import entropy_features, wavelet_features
+from signal_features import (
+    entropy_features,
+    signal_quality_index_features,
+    wavelet_features,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +182,9 @@ def full_features(
     long_rr_thresh_ms: Optional[float] = None,
     focus_peak_s: Optional[float] = None,
     morphology_half_width_s: float = 0.10,
+    compute_sqi_ensemble: bool = False,
+    bsqi: Optional[float] = None,
+    compute_onset_stability: bool = False,
 ) -> Tuple[Dict[str, float], Dict[str, str]]:
     """
     Compute the full Layer 2 feature vector for one ECG window.
@@ -201,6 +208,19 @@ def full_features(
     min_rr_for_spectral : minimum number of RR intervals for spectral HRV.
     short_rr_thresh_ms : override short-RR threshold for rr__ features.
     long_rr_thresh_ms : override long-RR threshold for rr__ features.
+    compute_sqi_ensemble : if True, add the signal-quality ensemble
+        (signal__ksqi, signal__psqi) to the feature vector. Default False so the
+        frozen feature set and existing calibrations are unchanged. Enable it
+        together with the SQI-ensemble hard rules in decision/config.py for
+        artifact-robust deployment.
+    bsqi : optional pre-computed two-detector agreement (see
+        signal_features.beat_detector_agreement_sqi). When provided and finite,
+        it is added as signal__bsqi. Only meaningful when compute_sqi_ensemble
+        is True; ignored otherwise.
+    compute_onset_stability : if True, add the ICD/AED-style onset and stability
+        discriminators (rr__onset_accel_frac, rr__stability_ms,
+        rr__tachy_fraction). Default False so the frozen feature set is
+        unchanged. Requires R-peaks.
 
     Returns
     -------
@@ -228,15 +248,22 @@ def full_features(
     ent  = entropy_features(window) if compute_entropy else {}
     amp  = amplitude_features(window)
     sqi  = spectral_sqi_features(window, fs)   # dimensionless power ratios
+    sqi_ensemble = signal_quality_index_features(window, fs) if compute_sqi_ensemble else {}
 
     features: Dict[str, float] = {}
     feature_groups: Dict[str, str] = {}
 
-    for raw_dict in (wave, ent, amp, sqi):
+    for raw_dict in (wave, ent, amp, sqi, sqi_ensemble):
         for k, v in raw_dict.items():
             key = f"signal__{k}"
             features[key] = float(v)
             feature_groups[key] = "signal"
+
+    # Two-detector agreement (bSQI) is supplied by the caller because it needs a
+    # second R-peak detector. Only surfaced when the SQI ensemble is enabled.
+    if compute_sqi_ensemble and bsqi is not None and np.isfinite(bsqi):
+        features["signal__bsqi"] = float(bsqi)
+        feature_groups["signal__bsqi"] = "signal"
 
     # ── Beat morphology (needs R-peak timing; focus_peak_s = trigger beat) ─
     if r_peaks_s is not None:
@@ -263,6 +290,7 @@ def full_features(
                 long_rr_thresh_ms=long_rr_thresh_ms,
                 compute_spectral=compute_spectral_hrv,
                 min_rr_for_spectral=min_rr_for_spectral,
+                compute_onset_stability=compute_onset_stability,
             )
             for k, v in rr_dict.items():
                 key = f"rr__{k}"

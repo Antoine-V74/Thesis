@@ -256,7 +256,10 @@ def main() -> None:
         for fname in ["phase1_per_beat.csv", "phase1_thresholds.csv",
                       "phase1_offline_operating_points.csv",
                       "phase1_metrics_by_dataset.csv", "phase1_metrics_overall.csv",
-                      "phase1_aurocs.csv"]:
+                      "phase1_aurocs.csv", "phase1_metrics_bootstrap.csv",
+                      "phase1_metrics_by_record.csv",
+                      "phase1_metrics_by_danger_subtype.csv",
+                      "phase1_cav_l2_l3.csv"]:
             assert_exists(bs_out / fname, f"Phase 1 output {fname}")
         phase1_cols = pd.read_csv(bs_out / "phase1_per_beat.csv", nrows=1).columns
         for col in ["arm", "scorer", "threshold_method", "threshold", "decision", "conformal_alpha_infeasible"]:
@@ -265,7 +268,7 @@ def main() -> None:
         assert "danger_2pct_offline" in set(phase1["threshold_method"].astype(str)), "missing offline danger operating point"
 
         if os.environ.get("LAYER3_SMOKE_MAE"):
-            mae_dir = tmp / "Results" / "layer3_pretrain_mae"
+            mae_dir = tmp / "Results" / "layer3_pretrain_mae_consistency"
             run([
                 PYTHON, str(THIS_DIR / "pretrain_encoder.py"),
                 "--window-index", str(windows_csv),
@@ -274,12 +277,30 @@ def main() -> None:
                 "--checkpoint-dir", str(mae_dir),
                 "--num-workers", "0",
                 "--seed", "0",
+                "--ssl-objective", "mae_consistency",
+                "--mask-ratio", "0.75",
+                "--consistency-lambda", "1.0",
+                "--vicreg-expander-dims", "64,64",
+                "--max-windows", "24",
+            ])
+            assert_exists(mae_dir / "encoder_last.pt", "MAE+same-window consistency checkpoint")
+
+        if os.environ.get("LAYER3_SMOKE_B1"):
+            b1_dir = tmp / "Results" / "layer3_pretrain_mae_subject"
+            run([
+                PYTHON, str(THIS_DIR / "pretrain_encoder.py"),
+                "--window-index", str(windows_csv),
+                "--epochs", "1",
+                "--batch-size", "8",
+                "--checkpoint-dir", str(b1_dir),
+                "--num-workers", "0",
+                "--seed", "0",
                 "--ssl-objective", "mae_subject_contrastive",
                 "--mask-ratio", "0.75",
                 "--subject-contrastive-lambda", "0.3",
                 "--max-windows", "24",
             ])
-            assert_exists(mae_dir / "encoder_last.pt", "MAE+subject contrastive checkpoint")
+            assert_exists(b1_dir / "encoder_last.pt", "MAE+subject contrastive B1 checkpoint")
 
         if os.environ.get("LAYER3_SMOKE_VICREG"):
             vicreg_dir = tmp / "Results" / "layer3_pretrain_vicreg"

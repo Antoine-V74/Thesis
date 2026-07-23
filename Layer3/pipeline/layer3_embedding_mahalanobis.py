@@ -105,7 +105,7 @@ class EmbeddingMahalanobisConfig:
     eps: float = 1e-6
     threshold_quantile: float = 0.99
     use_sqrt_distance: bool = True
-    covariance_estimator: str = "ledoit_wolf"  # "ledoit_wolf" or "diagonal_shrinkage"
+    covariance_estimator: str = "ledoit_wolf"  # ledoit_wolf, oas, diagonal, diagonal_shrinkage
 
 
 class EmbeddingMahalanobisBaseline:
@@ -144,7 +144,10 @@ class EmbeddingMahalanobisBaseline:
         centered = x - self.mean_
 
         estimator = str(self.config.covariance_estimator).lower()
-        if estimator == "ledoit_wolf" and x.shape[0] <= 2:
+        supported = {"ledoit_wolf", "oas", "diagonal", "diagonal_shrinkage"}
+        if estimator not in supported:
+            raise ValueError(f"Unsupported covariance_estimator={estimator!r}; choose from {sorted(supported)}")
+        if estimator in {"ledoit_wolf", "oas"} and x.shape[0] <= 2:
             estimator = "diagonal_shrinkage"
         if estimator == "ledoit_wolf" and x.shape[0] > 2:
             try:
@@ -155,8 +158,15 @@ class EmbeddingMahalanobisBaseline:
                 # Fall back to the historical diagonal shrinkage path if sklearn
                 # is unavailable or Ledoit-Wolf fails on a degenerate calibration.
                 estimator = "diagonal_shrinkage"
+        elif estimator == "oas" and x.shape[0] > 2:
+            try:
+                from sklearn.covariance import OAS
+                oas = OAS().fit(x)
+                cov = np.asarray(oas.covariance_, dtype=np.float64)
+            except Exception:
+                estimator = "diagonal_shrinkage"
 
-        if estimator != "ledoit_wolf":
+        if estimator not in {"ledoit_wolf", "oas"}:
             if x.shape[0] <= 2:
                 # Degenerate fallback for tiny calibration segments.
                 var = np.var(centered, axis=0) + self.config.eps
@@ -166,11 +176,14 @@ class EmbeddingMahalanobisBaseline:
                 if cov.ndim == 0:
                     cov = np.array([[float(cov)]], dtype=np.float64)
 
-            # Historical fallback: shrink empirical covariance toward its diagonal
-            # for stability when dim is high or calibration data are limited.
             diag = np.diag(np.diag(cov))
-            shrink = float(np.clip(self.config.shrinkage, 0.0, 1.0))
-            cov = (1.0 - shrink) * cov + shrink * diag
+            if estimator == "diagonal":
+                cov = diag
+            else:
+                # Historical fallback: shrink empirical covariance toward its
+                # diagonal for stability in the small-calibration regime.
+                shrink = float(np.clip(self.config.shrinkage, 0.0, 1.0))
+                cov = (1.0 - shrink) * cov + shrink * diag
 
         if cov.ndim == 0:
             cov = np.array([[float(cov)]], dtype=np.float64)
